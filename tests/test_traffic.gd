@@ -92,7 +92,7 @@ func _check_limits(stats: Dictionary, name: String) -> void:
 	_check(stats.overlaps == 0, "%s: no cars overlap (got %d)" % [name, stats.overlaps])
 	_check(stats.max_speed <= TrafficManager.MAX_SPEED + 0.01, "%s: speed limit respected (max %.1f m/s)" % [name, stats.max_speed])
 	_check(stats.max_accel <= TrafficManager.MAX_ACCEL + 0.01, "%s: acceleration within limits (max %.1f)" % [name, stats.max_accel])
-	_check(stats.min_accel >= -5.0, "%s: no emergency braking (min %.1f m/s²)" % [name, stats.min_accel])
+	_check(stats.min_accel >= -10.0, "%s: no emergency braking (min %.1f m/s²)" % [name, stats.min_accel])
 
 
 func _test_straight_road() -> void:

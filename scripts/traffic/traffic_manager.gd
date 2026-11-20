@@ -10,9 +10,9 @@ extends Node3D
 
 const MAX_SPEED := 70.0 / 3.6
 ## IDM parameters.
-const MAX_ACCEL := 2.5
-const COMFORT_DECEL := 3.0
-const MAX_DECEL := 9.0
+const MAX_ACCEL := 5.0
+const COMFORT_DECEL := 6.0
+const MAX_DECEL := 18.0
 const MIN_GAP := 2.0
 const TIME_HEADWAY := 1.2
 const ACCEL_EXPONENT := 4.0
@@ -289,6 +289,23 @@ func _acceleration(car: Car) -> float:
 					var vl := p.speed_limit[i]
 					v0 = minf(v0, sqrt(vl * vl + 2.0 * COMFORT_DECEL * d))
 					need = maxf(need, (v * v - vl * vl) / (2.0 * maxf(d, 0.5)))
+		# Next junction: stop at the line unless our path through it is reserved.
+		if p.is_connection and k > car.index and not junction_checked:
+			junction_checked = true
+			if not p.conflicts.is_empty() and not car.granted.has(k):
+				var to_line := maxf(to_piece - STOP_LINE_MARGIN, 0.0)
+				if to_line >= JUNCTION_REQUEST_DISTANCE or not _try_reserve(car, p, k):
+					# We stop at the line, so cars beyond it don't matter yet.
+					leader_found = true
+					var va := JUNCTION_APPROACH_SPEED
+					approach = minf(approach, sqrt(va * va + 2.0 * COMFORT_DECEL * to_line))
+					approach_need = (v * v - va * va) / (2.0 * maxf(to_line, 0.5))
+					if to_line < JUNCTION_REQUEST_DISTANCE:
+						# A stop line needs no time gap, just room to stop.
+						var term := _idm_interaction(v, to_line, v, 0.0)
+						if term < accel:
+							accel = term
+							car.limit = "junction"
 		# Car ahead.
 		if not leader_found:
 			for other: Car in _piece_cars.get(p.id, []):
@@ -300,21 +317,6 @@ func _acceleration(car: Car) -> float:
 					car.limit = "leader"
 				leader_found = true
 				break
-		# Next junction: stop at the line unless our path through it is reserved.
-		if p.is_connection and k > car.index and not junction_checked:
-			junction_checked = true
-			if not p.conflicts.is_empty() and not car.granted.has(k):
-				var to_line := maxf(to_piece - STOP_LINE_MARGIN, 0.0)
-				if to_line >= JUNCTION_REQUEST_DISTANCE or not _try_reserve(car, p, k):
-					var va := JUNCTION_APPROACH_SPEED
-					approach = minf(approach, sqrt(va * va + 2.0 * COMFORT_DECEL * to_line))
-					approach_need = (v * v - va * va) / (2.0 * maxf(to_line, 0.5))
-					if to_line < JUNCTION_REQUEST_DISTANCE:
-						# A stop line needs no time gap, just room to stop.
-						var term := _idm_interaction(v, to_line, v, 0.0)
-						if term < accel:
-							accel = term
-							car.limit = "junction"
 		to_piece += p.length
 		k += 1
 	if accel == INF:
