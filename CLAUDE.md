@@ -18,8 +18,18 @@ Node/segment graph with lane-level connections (Cities: Skylines style). Traffic
   - `connection_curve()` gives the path through a junction, intended for future vehicles.
   - Lane snapping: a one-lane road can attach to a node or segment at the road center or at a lane center of a wider road (closest to the mouse). It stays connected to the same node; the segment stores `start_offset`/`end_offset` (end point relative to node), and junction trimming and sorting use these offsets. Multi-lane types reset offsets to 0 on upgrade.
   - Lane direction mismatch: lanes of different segments that meet at the same spot (< 0.5 m) but travel in opposite directions set `RoadNode.lane_mismatch` and show a billboard icon (`icons/lane_mismatch.svg`). It's allowed, only flagged. `build_road(curve, type, start, end)` takes end dictionaries `{node, on_segment, anchor}`.
-- `road_tool.gd`: `RoadTool` input modes (straight/curved/freeform drawing, upgrade/reverse, lanes, bulldoze), snapping (nodes, segments, soft 15° / 8 m grid) and previews.
+- `road_tool.gd`: `RoadTool` input modes (straight/curved/freeform drawing, upgrade/reverse, lanes, node, bulldoze), snapping (nodes, segments, soft 15° / 8 m grid) and previews.
 - `road_overlay.gd` (lane debug view), `tri_batch.gd` (gizmo triangles), `road_mesh_builder.gd`, `scripts/ui/road_toolbar.gd` (UI built in code, forced LTR).
+
+### Node Controller (junction shaping)
+
+- Per road end, `RoadSegment.start_settings`/`end_settings` (`EndSettings`): `offset` (m added to the automatic trim), `shift` (m sideways; stored in `start_offset`/`end_offset`, which also hold lane snapping), `rotate` (degrees, slants the end edge via `skew_start`/`skew_end`), `stretch` (width fraction, tapers over 15 m) and `radius` (curb radius of the corner on the end's right side, < 0 = automatic). Sides are seen looking outward from the node: positive = right.
+- A custom curb is a circular arc and pushes both adjacent road ends back so it fits (`_fillet_tangent`); automatic corners keep the old Bezier rounding.
+- `RoadNode.mode` (`NodeMode`): AUTO, MIDDLE (2 roads meet untrimmed, no junction surface), STRETCH (2 roads, ≥ 12 m transition), UTURN (default connections include U-turns). MIDDLE/STRETCH act as AUTO unless the node has exactly 2 roads (`effective_mode`).
+- Lanes end on the slanted edges (`_lane_end_distance`) and follow stretch, so traffic paths through the junction follow the edited shape.
+- Settings survive splits (the far piece keeps them), type changes (shift is re-applied) and reversing; new ends start at defaults; a removed road's settings go with it.
+- API: `get_end_settings`/`set_end_settings`, `set_node_mode`, `reset_node`, `copy_node_settings`/`paste_node_settings` (matched by order around the node), `node_end_info` (handle positions), `align_corner` (moves a corner onto a point; holds a target corner of the same node in place).
+- UI: Node tool in `road_tool.gd` (drag blue = offset / Shift+drag = shift, yellow corners = angle, green = curb radius, A = align, Ctrl+C/V, R) and `scripts/ui/node_panel.gd` (`NodePanel`, sliders per road end).
 
 ## Traffic (`scripts/traffic/`)
 
@@ -32,8 +42,9 @@ Node/segment graph with lane-level connections (Cities: Skylines style). Traffic
 ## Tests
 
 - `tests/test_roads.gd`: headless network tests. Run with `-s res://tests/test_roads.gd` (add `--headless --path ... --log-file ...` as above). It prints `ROAD TESTS: PASS` and exits 0. Run `--import` first after adding new `class_name` scripts.
-- `tests/test_traffic.gd`: headless traffic tests on a 400 m map (trips complete, no car overlaps via an oriented-box check, speed/accel limits, no emergency braking, bends slow cars, one-way direction, network edits while driving). Prints `TRAFFIC TESTS: PASS`. Takes about 20 s.
+- `tests/test_traffic.gd`: headless traffic tests on a 400 m map (trips complete, no car overlaps via an oriented-box check, speed/accel limits, no emergency braking, bends slow cars, one-way direction, network edits while driving, a crossing edited with the Node Controller). Prints `TRAFFIC TESTS: PASS`. Takes about 20 s.
 - `tests/demo_roads.gd`: sample network with the overlay and lane tool on, for rendered frames.
+- `tests/demo_node_controller.gd`: junctions shaped with the Node Controller and the Node tool open. Pass `-- close` for a zoomed-in view with the lane overlay.
 - `tests/demo_traffic.gd`: border-to-border roads with 150 s of pre-simulated traffic and a fixed camera, for rendered frames.
 
 ## Rendering a test frame

@@ -55,6 +55,7 @@ func _ready() -> void:
 		["Freeform", RoadTool.Mode.FREEFORM],
 		["Upgrade", RoadTool.Mode.UPGRADE],
 		["Lanes", RoadTool.Mode.LANES],
+		["Node", RoadTool.Mode.NODE],
 		["Bulldoze", RoadTool.Mode.BULLDOZE],
 	]
 	for entry: Array in tools:
@@ -76,6 +77,10 @@ func _ready() -> void:
 
 	if traffic:
 		_build_traffic_panel()
+
+	var node_panel := NodePanel.new()
+	add_child(node_panel)
+	node_panel.setup(tool, tool.network)
 
 
 func _process(_delta: float) -> void:

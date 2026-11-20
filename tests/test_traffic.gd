@@ -16,6 +16,7 @@ func _initialize() -> void:
 	_one = RoadType.get_type(&"one_way")
 	_test_straight_road()
 	_test_crossing()
+	_test_edited_crossing()
 	_test_bend_slows_cars()
 	_test_one_way()
 	_test_network_change_while_driving()
@@ -126,6 +127,43 @@ func _test_crossing() -> void:
 	_check(traffic.completed_trips >= 70, "crossing: traffic flows through the junction (%d trips)" % traffic.completed_trips)
 	_check(traffic.cars.size() < 40, "crossing: queues stay short (%d cars left)" % traffic.cars.size())
 	_check_limits(stats, "crossing")
+	net.free()
+	traffic.free()
+
+
+## A crossing shaped with the Node Controller: wide curbs, one slanted and one
+## shifted road end. Cars must still flow, follow the new lane ends and not collide.
+func _test_edited_crossing() -> void:
+	var setup := _setup(5.0)
+	var net: RoadNetwork = setup[0]
+	var traffic: TrafficManager = setup[1]
+	net.build_road(RoadCurve.straight(Vector3(-HALF, 0, 0), Vector3(HALF, 0, 0)), _two)
+	net.build_road(RoadCurve.straight(Vector3(0, 0, -HALF), Vector3(0, 0, HALF)), _two)
+	var c := net.find_node_near(Vector3.ZERO, 0.5)
+	var turn_lengths := {}
+	traffic.step(DT)
+	for p in traffic.graph.pieces:
+		if p.is_connection and p.node_id == c:
+			turn_lengths[[p.in_key, p.out_key]] = p.length
+	for info in net.node_end_info(c):
+		var s: RoadNetwork.EndSettings = info.settings
+		s.radius = 12.0
+		if (info.out as Vector3).x > 0.9:
+			s.rotate = 15.0
+		elif (info.out as Vector3).z > 0.9:
+			s.shift = 1.0
+		net.set_end_settings(c, info.segment_id, s)
+	var stats := _run(traffic, 200.0)
+	var longer := 0
+	var total := 0
+	for p in traffic.graph.pieces:
+		if p.is_connection and p.node_id == c and turn_lengths.has([p.in_key, p.out_key]):
+			total += 1
+			if p.length > turn_lengths[[p.in_key, p.out_key]] + 1.0:
+				longer += 1
+	_check(total == 12 and longer == 12, "edited crossing: wider curbs lengthen all 12 paths (%d of %d)" % [longer, total])
+	_check(traffic.completed_trips >= 40, "edited crossing: traffic flows (%d trips)" % traffic.completed_trips)
+	_check_limits(stats, "edited crossing")
 	net.free()
 	traffic.free()
 

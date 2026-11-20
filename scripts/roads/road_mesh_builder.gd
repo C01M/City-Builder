@@ -29,6 +29,36 @@ static func build_strip(curve: RoadCurve, from_d: float, to_d: float, width: flo
 	return st.commit()
 
 
+## Road surface whose left and right sides start and end at their own distances
+## along `curve` (slanted end edges). `half_width.call(d)` gives the half width
+## at distance d; pass `varying_width` so straight roads still get enough samples.
+static func build_strip_sides(curve: RoadCurve, from_l: float, from_r: float, to_l: float, to_r: float,
+		half_width: Callable, y: float, varying_width: bool = false) -> ArrayMesh:
+	var st := SurfaceTool.new()
+	st.begin(Mesh.PRIMITIVE_TRIANGLES)
+	var span := maxf(to_l - from_l, to_r - from_r)
+	var steps := 1 if curve.is_straight() and not varying_width else maxi(1, ceili(span / SAMPLE_SPACING))
+	var prev_l := Vector3.ZERO
+	var prev_r := Vector3.ZERO
+	for i in steps + 1:
+		var f := float(i) / steps
+		var l := _edge_point(curve, lerpf(from_l, to_l, f), -1.0, half_width, y)
+		var r := _edge_point(curve, lerpf(from_r, to_r, f), 1.0, half_width, y)
+		if i > 0:
+			add_tri(st, prev_l, prev_r, r)
+			add_tri(st, prev_l, r, l)
+		prev_l = l
+		prev_r = r
+	return st.commit()
+
+
+static func _edge_point(curve: RoadCurve, d: float, side: float, half_width: Callable, y: float) -> Vector3:
+	var t := curve.t_at_distance(d)
+	var p := curve.point(t) + curve.tangent(t).cross(Vector3.UP).normalized() * side * float(half_width.call(d))
+	p.y = y
+	return p
+
+
 ## Filled polygon given as ground-plane (x, z) points. Returns null if it can't be triangulated.
 static func build_polygon(points: PackedVector2Array, y: float) -> ArrayMesh:
 	var indices := Geometry2D.triangulate_polygon(points)

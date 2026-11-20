@@ -1,11 +1,14 @@
 class_name RoadTool
 extends Node3D
 ## Mouse tools for the road network: drawing (straight / curved / freeform),
-## upgrading or reversing, bulldozing, and editing lane connections.
+## upgrading or reversing, bulldozing, editing lane connections, and shaping
+## junctions (Node Controller).
 
 signal hint_changed(text: String)
+## The Node Controller's selected node or align state changed.
+signal node_tool_changed
 
-enum Mode { STRAIGHT, CURVED, FREEFORM, UPGRADE, LANES, BULLDOZE }
+enum Mode { STRAIGHT, CURVED, FREEFORM, UPGRADE, LANES, BULLDOZE, NODE }
 
 const MAP_HALF_SIZE := 1000.0
 const BORDER_SNAP_DISTANCE := 8.0
@@ -36,6 +39,13 @@ const COLOR_LANE_IN := Color(1.0, 0.6, 0.1, 0.95)
 const COLOR_LANE_OUT := Color(0.3, 0.95, 0.4, 0.95)
 const COLOR_CONNECTION := Color(0.3, 0.85, 1.0, 0.35)
 const COLOR_CONNECTION_SELECTED := Color(1.0, 1.0, 0.3, 0.95)
+const COLOR_HANDLE_CENTER := Color(0.3, 0.7, 1.0, 0.95)
+const COLOR_HANDLE_CORNER := Color(1.0, 0.85, 0.2, 0.95)
+const COLOR_HANDLE_CURB := Color(0.35, 0.95, 0.45, 0.95)
+const COLOR_ALIGN := Color(1.0, 0.5, 0.15, 1.0)
+const COLOR_EDITED_NODE := Color(0.3, 0.7, 1.0, 0.6)
+const HANDLE_PICK_RADIUS := 1.1
+const HANDLE_Y := 0.12
 
 const HINTS := {
 	Mode.STRAIGHT: "Left click: start / place road  ·  Right click: stop  ·  Shift: no angle/length snapping  ·  Ends at the map edge bring traffic",
@@ -44,6 +54,7 @@ const HINTS := {
 	Mode.UPGRADE: "Left click a road: change it to the selected type (same one-way type: reverse)  ·  Right click: reverse one-way",
 	Mode.LANES: "Click a junction, then an incoming lane (orange), then outgoing lanes (green) to toggle  ·  R: reset junction  ·  Right click: back",
 	Mode.BULLDOZE: "Left click a road to delete it",
+	Mode.NODE: "Click a junction, then drag its handles (Shift: sideways)  ·  A: align corners  ·  Ctrl+C / V: copy / paste  ·  R: reset",
 }
 
 @export var network: RoadNetwork
@@ -71,6 +82,16 @@ var _snap: Dictionary = {}
 var _hover_segment := -1
 var _lane_node := -1
 var _lane_selected := -1
+
+# Node Controller state.
+## Junction being edited (-1 = none).
+var selected_node := -1
+## True while picking two corners to align.
+var aligning := false
+var _align_source: Dictionary = {}
+## Handle being dragged: {kind, segment_id, side, start, settings, info}.
+var _drag: Dictionary = {}
+var _clipboard: Dictionary = {}
 
 var _preview: MeshInstance3D
 var _gizmo: MeshInstance3D
@@ -116,6 +137,12 @@ func cancel() -> void:
 	_start_ref = Vector3.ZERO
 	_lane_node = -1
 	_lane_selected = -1
+	_drag = {}
+	if selected_node >= 0 or aligning:
+		selected_node = -1
+		aligning = false
+		_align_source = {}
+		node_tool_changed.emit()
 
 
 func _process(_delta: float) -> void:
@@ -135,12 +162,156 @@ func _unhandled_input(event: InputEvent) -> void:
 			_update_cursor()
 			_on_right_click()
 			get_viewport().set_input_as_handled()
+	elif event is InputEventMouseButton and not event.pressed:
+		if (event as InputEventMouseButton).button_index == MOUSE_BUTTON_LEFT and not _drag.is_empty():
+			_drag = {}
+			get_viewport().set_input_as_handled()
+	elif event is InputEventMouseMotion and not _drag.is_empty():
+		_update_cursor()
+		if _cursor_ok:
+			_update_drag()
 	elif event is InputEventKey and event.pressed and not event.echo:
 		var key := event as InputEventKey
 		if key.keycode == KEY_ESCAPE:
 			_on_right_click()
 		elif key.keycode == KEY_R and mode == Mode.LANES and _lane_node >= 0:
 			network.reset_connections(_lane_node)
+		elif mode == Mode.NODE and selected_node >= 0:
+			if key.keycode == KEY_R:
+				reset_node()
+			elif key.keycode == KEY_A:
+				set_aligning(not aligning)
+			elif key.keycode == KEY_C and key.ctrl_pressed:
+				copy_node()
+			elif key.keycode == KEY_V and key.ctrl_pressed:
+				paste_node()
+
+
+# ---------------------------------------------------------------- node controller
+
+func select_node(node_id: int) -> void:
+	if node_id == selected_node:
+		return
+	selected_node = node_id
+	aligning = false
+	_align_source = {}
+	_drag = {}
+	node_tool_changed.emit()
+
+
+func set_aligning(on: bool) -> void:
+	aligning = on and selected_node >= 0
+	_align_source = {}
+	node_tool_changed.emit()
+
+
+func reset_node() -> void:
+	if selected_node >= 0:
+		network.reset_node(selected_node)
+
+
+func copy_node() -> void:
+	if selected_node >= 0:
+		_clipboard = network.copy_node_settings(selected_node)
+		node_tool_changed.emit()
+
+
+func paste_node() -> void:
+	if selected_node >= 0 and not _clipboard.is_empty():
+		network.paste_node_settings(selected_node, _clipboard)
+
+
+func has_clipboard() -> bool:
+	return not _clipboard.is_empty()
+
+
+func _click_node() -> void:
+	if selected_node >= 0 and network.nodes.has(selected_node):
+		var h := _handle_under_cursor(aligning)
+		if not h.is_empty():
+			if aligning:
+				_click_align(h)
+			else:
+				var info: Dictionary = h.info
+				_drag = {"kind": h.kind, "segment_id": h.segment_id, "side": h.side,
+					"start": _cursor, "settings": (info.settings as RoadNetwork.EndSettings).copy(), "info": info}
+			return
+	var nid := _junction_under_cursor()
+	if nid >= 0 and network.get_node_data(nid).segment_ids.size() < 2:
+		nid = -1
+	if nid >= 0 or not aligning:
+		select_node(nid)
+
+
+## First click picks the corner to move, the second the corner to move it onto.
+func _click_align(h: Dictionary) -> void:
+	if _align_source.is_empty():
+		_align_source = h
+		return
+	if h.segment_id == _align_source.segment_id:
+		_align_source = h  # pick a corner of another road end as the target
+		return
+	network.align_corner(selected_node, _align_source.segment_id, _align_source.side, h.pos, h.segment_id, h.side)
+	set_aligning(false)
+
+
+func _update_drag() -> void:
+	if selected_node < 0 or not network.nodes.has(selected_node) or network.get_segment(_drag.segment_id) == null:
+		_drag = {}
+		return
+	var info: Dictionary = _drag.info
+	var s0: RoadNetwork.EndSettings = _drag.settings
+	var s := s0.copy()
+	var delta := _cursor - (_drag.start as Vector3)
+	delta.y = 0.0
+	match _drag.kind:
+		"center":
+			if Input.is_key_pressed(KEY_SHIFT):
+				s.shift = snappedf(s0.shift + delta.dot(info.side), 0.05)
+			else:
+				s.offset = snappedf(s0.offset + delta.dot(info.out), 0.1)
+		"corner":
+			# Move one corner along its edge; the other corner stays put.
+			var side: float = _drag.side
+			var along := delta.dot(info.out_right if side > 0.0 else info.out_left)
+			s.offset = s0.offset + along * 0.5
+			var skew := tan(deg_to_rad(s0.rotate)) + side * along / (2.0 * float(info.half))
+			s.rotate = snappedf(clampf(rad_to_deg(atan(skew)), -RoadNetwork.MAX_ROTATE, RoadNetwork.MAX_ROTATE), 0.5)
+		"curb":
+			var curb: Dictionary = info.curb
+			var dist := (_cursor - (curb.x as Vector3)).dot(curb.bisector)
+			s.radius = snappedf(maxf(0.0, dist / maxf(float(curb.factor), 0.05)), 0.25)
+	network.set_end_settings(selected_node, _drag.segment_id, s)
+
+
+## Draggable handles of the selected node: {kind, segment_id, side, pos, info}.
+## Kinds: "center" (cut center), "corner" (side -1 left / 1 right), "curb".
+func _node_handles() -> Array[Dictionary]:
+	var handles: Array[Dictionary] = []
+	if selected_node < 0 or not network.nodes.has(selected_node):
+		return handles
+	for info in network.node_end_info(selected_node):
+		var sid: int = info.segment_id
+		handles.append({"kind": "center", "segment_id": sid, "side": 0, "pos": info.center, "info": info})
+		handles.append({"kind": "corner", "segment_id": sid, "side": -1, "pos": info.left, "info": info})
+		handles.append({"kind": "corner", "segment_id": sid, "side": 1, "pos": info.right, "info": info})
+		var curb: Dictionary = info.curb
+		if not curb.is_empty():
+			handles.append({"kind": "curb", "segment_id": sid, "side": 1, "pos": curb.mid, "info": info})
+	return handles
+
+
+func _handle_under_cursor(corners_only: bool = false) -> Dictionary:
+	var best: Dictionary = {}
+	var best_d := HANDLE_PICK_RADIUS
+	for h in _node_handles():
+		if corners_only and h.kind != "corner":
+			continue
+		var d := _flat_distance(_cursor, h.pos)
+		if d < best_d:
+			best_d = d
+			best = h
+	return best
 
 
 # ---------------------------------------------------------------- clicks
@@ -162,10 +333,21 @@ func _on_left_click() -> void:
 				network.remove_segment(seg.id)
 		Mode.LANES:
 			_click_lanes()
+		Mode.NODE:
+			_click_node()
 
 
 func _on_right_click() -> void:
 	match mode:
+		Mode.NODE:
+			if not _drag.is_empty():
+				# Undo the drag in progress.
+				network.set_end_settings(selected_node, _drag.segment_id, _drag.settings)
+				_drag = {}
+			elif aligning:
+				set_aligning(false)
+			else:
+				select_node(-1)
 		Mode.UPGRADE:
 			var seg := _segment_under_cursor()
 			if seg and seg.type.is_one_way():
@@ -430,6 +612,8 @@ func _update_visuals() -> void:
 			_draw_segment_hover(batch)
 		Mode.LANES:
 			_draw_lanes(batch)
+		Mode.NODE:
+			_draw_node(batch)
 	if not _label.visible:
 		var hover := network.find_node_near(_cursor, NODE_SNAP_RADIUS)
 		if hover >= 0 and network.has_lane_mismatch(hover):
@@ -548,6 +732,62 @@ func _draw_lanes(batch: TriBatch) -> void:
 			batch.ring(e.position, 1.25, 0.2, Color(1, 1, 1, 0.6))
 	if network.has_custom_connections(_lane_node):
 		_show_label("Custom lane connections (R to reset)")
+
+
+func _draw_node(batch: TriBatch) -> void:
+	if selected_node >= 0 and not network.nodes.has(selected_node):
+		select_node(-1)
+	# Mark every junction; edited ones in blue.
+	for node: RoadNetwork.RoadNode in network.nodes.values():
+		if node.id != selected_node and node.segment_ids.size() >= 2:
+			var edited := network.has_node_settings(node.id)
+			batch.disc(node.position, 1.0, COLOR_EDITED_NODE if edited else Color(1, 1, 1, 0.35))
+	if selected_node < 0:
+		var hover := _junction_under_cursor()
+		if hover >= 0 and network.get_node_data(hover).segment_ids.size() >= 2:
+			batch.ring(network.get_node_data(hover).position, 3.0, 0.3, COLOR_GUIDE)
+		return
+
+	var up := Vector3.UP * HANDLE_Y
+	var hovered := {} if not _drag.is_empty() else _handle_under_cursor(aligning)
+	for info in network.node_end_info(selected_node):
+		var left: Vector3 = info.left + up
+		var right: Vector3 = info.right + up
+		batch.ribbon(PackedVector3Array([left, right]), 0.18, Color(1, 1, 1, 0.8))
+		var curb: Dictionary = info.curb
+		if not curb.is_empty() and not aligning:
+			var custom: bool = float(curb.radius) >= 0.0
+			batch.disc((curb.mid as Vector3) + up, 0.55, COLOR_HANDLE_CURB if custom else COLOR_HANDLE_CURB * Color(1, 1, 1, 0.55))
+		if not aligning:
+			batch.disc((info.center as Vector3) + up, 0.8, COLOR_HANDLE_CENTER)
+			batch.arrow((info.center as Vector3) + up + (info.out as Vector3) * 1.6, info.out, 0.5, COLOR_HANDLE_CENTER)
+		var corner_size := 0.7 if aligning else 0.5
+		batch.disc(left, corner_size, COLOR_HANDLE_CORNER)
+		batch.disc(right, corner_size, COLOR_HANDLE_CORNER)
+	if not _align_source.is_empty():
+		batch.ring((_align_source.pos as Vector3) + up, 1.0, 0.25, COLOR_ALIGN)
+	if not hovered.is_empty():
+		batch.ring((hovered.pos as Vector3) + up, 1.0, 0.2, Color.WHITE)
+
+	if aligning:
+		_show_label("Align: pick the corner to move" if _align_source.is_empty() else "Align: pick the corner to move it onto", COLOR_ALIGN)
+	elif not _drag.is_empty():
+		var s := network.get_end_settings(selected_node, _drag.segment_id)
+		match _drag.kind:
+			"center":
+				_show_label("Shift %+.2f m" % s.shift if Input.is_key_pressed(KEY_SHIFT) else "Offset %+.1f m" % s.offset)
+			"corner":
+				_show_label("Rotate %+.1f°  ·  Offset %+.1f m" % [s.rotate, s.offset])
+			"curb":
+				_show_label("Curb radius %.2f m" % s.radius)
+	elif not hovered.is_empty():
+		match hovered.kind:
+			"center":
+				_show_label("Drag: pull the road end back / forward  ·  Shift+drag: move it sideways")
+			"corner":
+				_show_label("Drag: angle the road end")
+			"curb":
+				_show_label("Drag: curb radius (wider turn)")
 
 
 func _preview_material(ok: bool) -> StandardMaterial3D:

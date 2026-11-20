@@ -17,6 +17,11 @@ func _initialize() -> void:
 	_test_curved_crossing()
 	_test_upgrade()
 	_test_lane_snapping()
+	_test_node_offset_rotate_shift()
+	_test_curb_radius()
+	_test_align_corner()
+	_test_node_modes()
+	_test_node_settings_survive_edits()
 	print("ROAD TESTS: %s (%d failures)" % ["PASS" if _failures == 0 else "FAIL", _failures])
 	quit(1 if _failures > 0 else 0)
 
@@ -220,3 +225,249 @@ func _test_lane_snapping() -> void:
 	_check(c.get_segment(c.get_node_data(cn).segment_ids[1]).end_offset == Vector3.ZERO, "center attach has no offset")
 	net.free()
 	c.free()
+
+
+# ---------------------------------------------------------------- node controller
+
+## A 4-way crossing of two-way roads at the origin; returns [net, center node].
+func _new_crossing() -> Array:
+	var net := _new_net()
+	net.build_road(RoadCurve.straight(Vector3(-50, 0, 0), Vector3(50, 0, 0)), _two)
+	net.build_road(RoadCurve.straight(Vector3(0, 0, -50), Vector3(0, 0, 50)), _two)
+	return [net, net.find_node_near(Vector3.ZERO, 0.5)]
+
+
+## Segment at `node_id` whose road leaves the node roughly along `dir`.
+func _end_toward(net: RoadNetwork, node_id: int, dir: Vector3) -> int:
+	for sid in net.get_node_data(node_id).segment_ids:
+		if net.outward_direction(node_id, sid).dot(dir) > 0.9:
+			return sid
+	return -1
+
+
+func _trim(net: RoadNetwork, node_id: int, sid: int) -> float:
+	var seg := net.get_segment(sid)
+	return seg.trim_start if seg.start_id == node_id else seg.trim_end
+
+
+func _info(net: RoadNetwork, node_id: int, sid: int) -> Dictionary:
+	for info in net.node_end_info(node_id):
+		if info.segment_id == sid:
+			return info
+	return {}
+
+
+func _lane_ends_of(net: RoadNetwork, node_id: int, sid: int) -> Array[RoadNetwork.LaneEnd]:
+	var result: Array[RoadNetwork.LaneEnd] = []
+	for e in net.get_lane_ends(node_id):
+		if e.segment_id == sid:
+			result.append(e)
+	return result
+
+
+func _lane_zs(net: RoadNetwork, node_id: int, sid: int) -> Array[float]:
+	var zs: Array[float] = []
+	for e in _lane_ends_of(net, node_id, sid):
+		zs.append(e.position.z)
+	zs.sort()
+	return zs
+
+
+func _test_node_offset_rotate_shift() -> void:
+	var setup := _new_crossing()
+	var net: RoadNetwork = setup[0]
+	var c: int = setup[1]
+	var east := _end_toward(net, c, Vector3.RIGHT)
+	var north := _end_toward(net, c, Vector3.FORWARD)
+	var auto_trim := _trim(net, c, east)
+	_check(net.node_end_info(c).size() == 4, "node controller: 4 road ends listed")
+	_check(not net.has_node_settings(c), "fresh junction has no settings")
+
+	# Offset pulls the road end back; the lanes end there too.
+	var s := net.get_end_settings(c, east)
+	s.offset = 5.0
+	net.set_end_settings(c, east, s)
+	_check(is_equal_approx(_trim(net, c, east), auto_trim + 5.0), "offset adds to the trim (got %.2f)" % _trim(net, c, east))
+	_check(is_equal_approx(_trim(net, c, north), auto_trim), "other ends keep their trim")
+	for e in _lane_ends_of(net, c, east):
+		_check(absf(e.position.x - (auto_trim + 5.0)) < 0.05, "lane ends follow the offset (x = %.2f)" % e.position.x)
+	_check(net.has_node_settings(c), "edited junction reports settings")
+
+	# Rotate slants the end edge: the right corner (+z for a road heading east) moves back.
+	s.rotate = 20.0
+	net.set_end_settings(c, east, s)
+	var info := _info(net, c, east)
+	var spread := (info.right as Vector3).x - (info.left as Vector3).x
+	_check(absf(spread - 2.0 * 3.0 * tan(deg_to_rad(20.0))) < 0.05, "rotated end: corners differ by 2 half tan(angle) (got %.2f)" % spread)
+	var ends := _lane_ends_of(net, c, east)
+	_check(ends.size() == 2 and absf(ends[0].position.x - ends[1].position.x) > 0.5, "lanes end along the slanted edge")
+
+	# Shift moves the road end sideways.
+	s.rotate = 0.0
+	s.shift = 1.5
+	net.set_end_settings(c, east, s)
+	var seg := net.get_segment(east)
+	_check(seg.offset_at(c).distance_to(Vector3(0, 0, 1.5)) < 0.01, "shift moves the end to the right (offset %s)" % seg.offset_at(c))
+	# The road bends toward its shifted end, so near the junction it's shifted by a bit less.
+	var zs := _lane_zs(net, c, east)
+	_check(zs.size() == 2 and (zs[0] + zs[1]) * 0.5 > 1.2 and absf((zs[1] - zs[0]) - 3.0) < 0.1, "shifted lanes move sideways (z = %s)" % [zs])
+
+	# Stretch widens the end; lanes spread with it.
+	s.shift = 0.0
+	s.stretch = 0.5
+	net.set_end_settings(c, east, s)
+	zs = _lane_zs(net, c, east)
+	_check(zs.size() == 2 and absf((zs[1] - zs[0]) - 4.5) < 0.1, "stretched end: lanes 1.5x apart (got %.2f)" % (zs[1] - zs[0]))
+	_check(net.get_segment(east).offset_at(c).length() < 0.01, "shift back to 0 restores the attachment")
+
+	net.reset_node(c)
+	_check(not net.has_node_settings(c), "reset clears all settings")
+	_check(is_equal_approx(_trim(net, c, east), auto_trim), "reset restores the automatic trim")
+	net.free()
+
+
+func _test_curb_radius() -> void:
+	var setup := _new_crossing()
+	var net: RoadNetwork = setup[0]
+	var c: int = setup[1]
+	var area_before := absf(RoadNetwork._polygon_area(net._junction_shape(net.get_node_data(c)).poly))
+	# Every corner gets a 10 m curb: at 90 degrees the curb needs 10 m along each
+	# edge beyond where the edges meet (3 m out), so every road end moves to 13 m.
+	for info in net.node_end_info(c):
+		var s: RoadNetwork.EndSettings = info.settings
+		s.radius = 10.0
+		net.set_end_settings(c, info.segment_id, s)
+	for sid in net.get_node_data(c).segment_ids:
+		_check(absf(_trim(net, c, sid) - 13.0) < 0.05, "10 m curb pushes the road end to 13 m (got %.2f)" % _trim(net, c, sid))
+	var area_after := absf(RoadNetwork._polygon_area(net._junction_shape(net.get_node_data(c)).poly))
+	_check(area_after > area_before * 3.0, "bigger curbs make a bigger junction (%.0f -> %.0f m2)" % [area_before, area_after])
+	for info in net.node_end_info(c):
+		var curb: Dictionary = info.curb
+		_check(not curb.is_empty(), "each corner has a curb")
+		if not curb.is_empty():
+			# The curb's middle is radius * (1/sin 45 - 1) from the corner.
+			var d := (curb.mid as Vector3).distance_to(curb.x)
+			_check(absf(d - 10.0 * (sqrt(2.0) - 1.0)) < 0.1, "curb is a 10 m arc (middle %.2f m from corner)" % d)
+	var east := _end_toward(net, c, Vector3.RIGHT)
+	var in_key := _incoming_key(net, c, east)
+	_check(in_key >= 0 and _outs(net, c, in_key).size() == 3, "connections still exist with custom curbs")
+	net.free()
+
+
+func _test_align_corner() -> void:
+	var setup := _new_crossing()
+	var net: RoadNetwork = setup[0]
+	var c: int = setup[1]
+	var east := _end_toward(net, c, Vector3.RIGHT)
+	var north := _end_toward(net, c, Vector3.FORWARD)
+	# Move the east end's right corner 3 m further out and 1 m to the right.
+	var before := _info(net, c, east)
+	var target: Vector3 = (before.right as Vector3) + Vector3(3, 0, 1)
+	var left_x: float = (before.left as Vector3).x
+	net.align_corner(c, east, 1, target)
+	var after := _info(net, c, east)
+	var miss := (after.right as Vector3).distance_to(target)
+	_check(miss < 0.05, "aligned corner reaches the target (off by %.3f)" % miss)
+	_check(absf((after.left as Vector3).x - left_x) < 0.05, "the other corner keeps its distance")
+	_check((after.settings as RoadNetwork.EndSettings).shift > 0.5, "align shifted the end sideways")
+
+	# Corner to corner: close the curb between the north road (heading -z) and the
+	# east road by moving north's right corner (+x side) onto east's left corner (-z side).
+	net.reset_node(c)
+	var east_left: Vector3 = _info(net, c, east).left
+	net.align_corner(c, north, 1, east_left, east, -1)
+	miss = (_info(net, c, north).right as Vector3).distance_to(_info(net, c, east).left)
+	_check(miss < 0.05, "corners meet after aligning (off by %.3f)" % miss)
+	var drift := (_info(net, c, east).left as Vector3).distance_to(east_left)
+	_check(drift < 0.05, "the target corner stays where it was (moved %.3f)" % drift)
+	net.free()
+
+
+func _test_node_modes() -> void:
+	# A bend: two roads meeting at (0, 0) at 30 degrees.
+	var net := _new_net()
+	net.build_road(RoadCurve.straight(Vector3(-50, 0, 0), Vector3.ZERO), _two)
+	var b := net.find_node_near(Vector3.ZERO, 0.1)
+	net.build_road(RoadCurve.straight(Vector3.ZERO, Vector3(43.3, 0, 25)), _two, {"node": b})
+	_check(net.get_node_data(b).segment_ids.size() == 2, "bend node joins two roads")
+	net.set_node_mode(b, RoadNetwork.NodeMode.MIDDLE)
+	for sid in net.get_node_data(b).segment_ids:
+		_check(_trim(net, b, sid) == 0.0, "middle node: roads meet without trimming")
+	_check(net.get_node_data(b).mesh_instance == null, "middle node has no junction surface")
+	net.set_node_mode(b, RoadNetwork.NodeMode.STRETCH)
+	for sid in net.get_node_data(b).segment_ids:
+		_check(_trim(net, b, sid) >= RoadNetwork.STRETCH_NODE_LENGTH - 0.01, "stretch node: long transition (%.1f m)" % _trim(net, b, sid))
+	# A third road turns MIDDLE back into a normal junction.
+	net.set_node_mode(b, RoadNetwork.NodeMode.MIDDLE)
+	net.build_road(RoadCurve.straight(Vector3.ZERO, Vector3(0, 0, -40)), _two, {"node": b})
+	_check(net.effective_mode(b) == RoadNetwork.NodeMode.AUTO, "middle needs exactly two roads")
+	_check(net.get_node_data(b).mesh_instance != null, "3 roads: junction surface is back")
+	net.free()
+
+	# U-turn mode: every incoming lane may also turn back.
+	var setup := _new_crossing()
+	var x: RoadNetwork = setup[0]
+	var c: int = setup[1]
+	x.set_node_mode(c, RoadNetwork.NodeMode.UTURN)
+	var conns := x.get_connections(c)
+	for k: int in conns:
+		_check((conns[k] as Array).size() == 4, "u-turn node: 4 exits per incoming lane")
+	x.free()
+
+
+func _test_node_settings_survive_edits() -> void:
+	var setup := _new_crossing()
+	var net: RoadNetwork = setup[0]
+	var c: int = setup[1]
+	var east := _end_toward(net, c, Vector3.RIGHT)
+	var s := net.get_end_settings(c, east)
+	s.offset = 4.0
+	s.radius = 8.0
+	net.set_end_settings(c, east, s)
+	# The far end of the east road (dead end at x = 50) gets a shift too.
+	var far := net.find_node_near(Vector3(50, 0, 0), 0.5)
+	var fs := net.get_end_settings(far, east)
+	fs.shift = 0.5
+	net.set_end_settings(far, east, fs)
+	far = net.find_node_near(Vector3(50, 0, 0), 0.5)
+
+	# Split the east road with a crossing street at x = 25.
+	net.build_road(RoadCurve.straight(Vector3(25, 0, -30), Vector3(25, 0, 30)), _two)
+	var near_east := _end_toward(net, c, Vector3.RIGHT)
+	var kept := net.get_end_settings(c, near_east)
+	_check(kept.offset == 4.0 and kept.radius == 8.0, "split keeps the settings at the junction")
+	var far_seg: int = net.get_node_data(far).segment_ids[0]
+	_check(net.get_end_settings(far, far_seg).shift == 0.5, "split keeps the settings at the far end")
+	var mid := net.find_node_near(Vector3(25, 0, 0), 0.5)
+	_check(mid >= 0 and not net.has_node_settings(mid), "the new junction starts automatic")
+
+	# Adding a road keeps the existing ends' settings.
+	net.build_road(RoadCurve.straight(Vector3.ZERO, Vector3(-30, 0, -30)), _two, {"node": c})
+	_check(net.get_end_settings(c, _end_toward(net, c, Vector3.RIGHT)).offset == 4.0, "adding a road keeps settings")
+
+	# Changing the type keeps them; reversing a one-way keeps them at the same node.
+	net.set_segment_type(near_east, _one)
+	_check(net.get_end_settings(c, near_east).offset == 4.0, "type change keeps settings")
+	net.reverse_segment(near_east)
+	_check(net.get_end_settings(c, near_east).offset == 4.0, "reverse keeps settings at the same node")
+	var shifted := net.get_end_settings(c, near_east)
+	shifted.shift = 1.0
+	net.set_end_settings(c, near_east, shifted)
+	net.set_segment_type(near_east, _two)
+	var expected := net.outward_direction(c, near_east).cross(Vector3.UP).normalized()
+	_check(net.get_segment(near_east).offset_at(c).distance_to(expected) < 0.01, "upgrade to two-way keeps the shift")
+
+	# Copy / paste onto another junction, matched by order around the node.
+	var copied := net.copy_node_settings(c)
+	net.paste_node_settings(mid, copied)
+	var count := 0
+	for sid in net.get_node_data(mid).segment_ids:
+		if net.get_end_settings(mid, sid).offset == 4.0:
+			count += 1
+	_check(count == 1, "paste applies the edited end's settings (%d ends)" % count)
+
+	# Removing the edited road drops its settings with it; the junction keeps working.
+	net.remove_segment(near_east)
+	_check(net.get_node_data(c).segment_ids.size() == 4, "road removed")
+	_check(net.get_node_data(c).mesh_instance != null, "junction still has a surface")
+	net.free()

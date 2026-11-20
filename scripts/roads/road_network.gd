@@ -18,6 +18,45 @@ const LANE_MASK := 63
 const LANE_ALIGN_DISTANCE := 0.5
 const WARNING_ICON_PATH := "res://icons/lane_mismatch.svg"
 const WARNING_ICON_HEIGHT := 5.0
+## Node Controller limits.
+const MAX_ROTATE := 70.0
+## Road length used for the width transition at a STRETCH node.
+const STRETCH_NODE_LENGTH := 12.0
+
+## How a node joins its roads (Node Controller). MIDDLE and STRETCH only apply
+## to nodes with exactly two roads; elsewhere they act like AUTO.
+##   AUTO     junction surface sized automatically
+##   MIDDLE   roads meet directly, no junction surface
+##   STRETCH  long, smooth transition between two roads
+##   UTURN    like AUTO, and every incoming lane may also turn around
+enum NodeMode { AUTO, MIDDLE, STRETCH, UTURN }
+
+
+## Node Controller settings for one road end. Sides are seen looking outward
+## from the node along the road: positive = right.
+class EndSettings:
+	## Extra pull-back of the road end (m) on top of the automatic trim.
+	var offset: float = 0.0
+	## Sideways move of the road end (m).
+	var shift: float = 0.0
+	## Angle of the end edge (degrees); positive pulls the right corner back.
+	var rotate: float = 0.0
+	## Width change at the end: 0.2 = 20% wider, tapering back along the road.
+	var stretch: float = 0.0
+	## Curb radius (m) of the junction corner on this end's right side; < 0 = automatic.
+	var radius: float = -1.0
+
+	func is_default() -> bool:
+		return offset == 0.0 and shift == 0.0 and rotate == 0.0 and stretch == 0.0 and radius < 0.0
+
+	func copy() -> EndSettings:
+		var s := EndSettings.new()
+		s.offset = offset
+		s.shift = shift
+		s.rotate = rotate
+		s.stretch = stretch
+		s.radius = radius
+		return s
 
 
 class RoadNode:
@@ -28,27 +67,60 @@ class RoadNode:
 	var custom_connections: Dictionary = {}
 	## True if two joined lanes at this node run in opposite directions.
 	var lane_mismatch: bool = false
+	var mode: int = 0  # NodeMode
 	var mesh_instance: MeshInstance3D
 	var warning_icon: Sprite3D
 
 
 class RoadSegment:
+	## Length over which a stretched end tapers back to the normal width.
+	const STRETCH_TAPER := 15.0
+
 	var id: int
 	var start_id: int
 	var end_id: int
 	var curve: RoadCurve
 	var type: RoadType
-	## Distance cut from each end to make room for the junction surface.
+	## Distance cut from each end (at the center line) to make room for the junction surface.
 	var trim_start: float = 0.0
 	var trim_end: float = 0.0
+	## Slant of each end edge: a point `x` m right of center (looking outward
+	## from the node) is cut at trim + x * skew.
+	var skew_start: float = 0.0
+	var skew_end: float = 0.0
 	## Where each end attaches relative to its node (non-zero when a narrower
-	## road is snapped to one lane of a wider road instead of its center).
+	## road is snapped to one lane of a wider road, or the end is shifted).
 	var start_offset: Vector3 = Vector3.ZERO
 	var end_offset: Vector3 = Vector3.ZERO
+	var start_settings := EndSettings.new()
+	var end_settings := EndSettings.new()
 	var mesh_instance: MeshInstance3D
 
 	func offset_at(node_id: int) -> Vector3:
 		return start_offset if node_id == start_id else end_offset
+
+	func settings_at(node_id: int) -> EndSettings:
+		return start_settings if node_id == start_id else end_settings
+
+	## Trim at the end at `node_id`, `lateral` m right of center (looking outward).
+	func trim_at(node_id: int, lateral: float) -> float:
+		if node_id == start_id:
+			return trim_start + lateral * skew_start
+		return trim_end + lateral * skew_end
+
+	## Distance along the curve from its start for a trim measured from the end at `node_id`.
+	func distance_from_end(node_id: int, trim: float) -> float:
+		return trim if node_id == start_id else curve.get_length() - trim
+
+	## Width multiplier at distance `d` along the curve (stretched ends).
+	func width_scale(d: float) -> float:
+		var s := 1.0
+		if start_settings.stretch != 0.0 or end_settings.stretch != 0.0:
+			var length := curve.get_length()
+			var taper := maxf(minf(STRETCH_TAPER, length * 0.4), 0.1)
+			s += start_settings.stretch * (1.0 - smoothstep(0.0, 1.0, (d - trim_start) / taper))
+			s += end_settings.stretch * (1.0 - smoothstep(0.0, 1.0, (length - trim_end - d) / taper))
+		return s
 
 
 ## One lane's end at a node (after trimming for the junction).
@@ -295,11 +367,13 @@ func split_segment(segment_id: int, t: float) -> int:
 	tail.end_offset = seg.end_offset
 	tail.curve = parts[1].with_endpoints(get_node_data(mid_id).position, end_node.position + tail.end_offset)
 	tail.type = seg.type
+	tail.end_settings = seg.end_settings
 	segments[tail.id] = tail
 
 	seg.curve = parts[0].with_endpoints(get_node_data(seg.start_id).position + seg.start_offset, get_node_data(mid_id).position)
 	seg.end_id = mid_id
 	seg.end_offset = Vector3.ZERO
+	seg.end_settings = EndSettings.new()
 
 	end_node.segment_ids[end_node.segment_ids.find(segment_id)] = tail.id
 	_remap_custom(end_node, segment_id, tail.id)
@@ -335,11 +409,14 @@ func set_segment_type(segment_id: int, type: RoadType) -> void:
 	if seg == null or seg.type == type:
 		return
 	seg.type = type
-	if type.lanes.size() > 1 and (seg.start_offset != Vector3.ZERO or seg.end_offset != Vector3.ZERO):
-		# Multi-lane roads attach at node centers.
-		seg.start_offset = Vector3.ZERO
-		seg.end_offset = Vector3.ZERO
-		seg.curve = seg.curve.with_endpoints(get_node_data(seg.start_id).position, get_node_data(seg.end_id).position)
+	if type.lanes.size() > 1:
+		# Multi-lane roads attach at node centers (plus any Node Controller shift).
+		var start_off := _shift_vector(seg, seg.start_id)
+		var end_off := _shift_vector(seg, seg.end_id)
+		if not start_off.is_equal_approx(seg.start_offset) or not end_off.is_equal_approx(seg.end_offset):
+			seg.start_offset = start_off
+			seg.end_offset = end_off
+			_update_segment_curve(seg)
 	_segment_lanes_changed(seg)
 
 
@@ -358,6 +435,9 @@ func reverse_segment(segment_id: int) -> void:
 	var o := seg.start_offset
 	seg.start_offset = seg.end_offset
 	seg.end_offset = o
+	var settings := seg.start_settings
+	seg.start_settings = seg.end_settings
+	seg.end_settings = settings
 	_segment_lanes_changed(seg)
 
 
@@ -372,22 +452,30 @@ func get_lane_ends(node_id: int) -> Array[LaneEnd]:
 	for sid in node.segment_ids:
 		var seg: RoadSegment = segments[sid]
 		var at_start := seg.start_id == node_id
-		var t := seg.curve.t_at_distance(seg.trim_start if at_start else seg.curve.get_length() - seg.trim_end)
-		var p := seg.curve.point(t)
-		var tan := seg.curve.tangent(t)
-		var right := tan.cross(Vector3.UP).normalized()
 		for i in seg.type.lanes.size():
 			var lane: RoadType.LaneDef = seg.type.lanes[i]
+			var d := _lane_end_distance(seg, node_id, lane.offset)
+			var t := seg.curve.t_at_distance(d)
+			var tan := seg.curve.tangent(t)
+			var right := tan.cross(Vector3.UP).normalized()
 			var e := LaneEnd.new()
 			e.key = lane_key(seg.id, i)
 			e.segment_id = seg.id
 			e.lane_index = i
 			e.incoming = lane.forward != at_start
-			e.position = p + right * lane.offset
+			e.position = seg.curve.point(t) + right * lane.offset * seg.width_scale(d)
 			e.position.y = ROAD_Y
 			e.direction = tan if lane.forward else -tan
 			result.append(e)
 	return result
+
+
+## Distance along the curve where a lane (`lane_offset` right of the center
+## line, in the segment's direction) ends at `node_id`, following a slanted end edge.
+func _lane_end_distance(seg: RoadSegment, node_id: int, lane_offset: float) -> float:
+	var side := 1.0 if node_id == seg.start_id else -1.0
+	var scale := seg.width_scale(seg.distance_from_end(node_id, seg.trim_at(node_id, 0.0)))
+	return seg.distance_from_end(node_id, seg.trim_at(node_id, lane_offset * scale * side))
 
 
 ## Incoming lane key -> Array of outgoing lane keys it connects to.
@@ -403,7 +491,7 @@ func get_connections(node_id: int) -> Dictionary:
 		if node.custom_connections.has(e.key):
 			result[e.key] = (node.custom_connections[e.key] as Array).duplicate()
 		else:
-			result[e.key] = _default_outs(e, ends)
+			result[e.key] = _default_outs(e, ends, node.mode == NodeMode.UTURN)
 	return result
 
 
@@ -439,6 +527,221 @@ func reset_connections(node_id: int) -> void:
 		changed.emit()
 
 
+# ---------------------------------------------------------------- node controller
+
+## The node's mode as it actually applies (MIDDLE / STRETCH need exactly two roads).
+func effective_mode(node_id: int) -> NodeMode:
+	var node := get_node_data(node_id)
+	if node == null:
+		return NodeMode.AUTO
+	if (node.mode == NodeMode.MIDDLE or node.mode == NodeMode.STRETCH) and node.segment_ids.size() != 2:
+		return NodeMode.AUTO
+	return node.mode as NodeMode
+
+
+func set_node_mode(node_id: int, mode: NodeMode) -> void:
+	var node := get_node_data(node_id)
+	if node == null or node.mode == mode:
+		return
+	node.mode = mode
+	_dirty_nodes[node_id] = true
+	_rebuild_dirty()
+	changed.emit()
+
+
+## A copy of the settings of the road end of `segment_id` at `node_id`.
+func get_end_settings(node_id: int, segment_id: int) -> EndSettings:
+	var seg := get_segment(segment_id)
+	if seg == null:
+		return EndSettings.new()
+	return seg.settings_at(node_id).copy()
+
+
+func set_end_settings(node_id: int, segment_id: int, settings: EndSettings) -> void:
+	var seg := get_segment(segment_id)
+	if seg == null or (seg.start_id != node_id and seg.end_id != node_id):
+		return
+	_apply_end_settings(seg, node_id, settings)
+	_rebuild_dirty()
+	changed.emit()
+
+
+## True if the node or any of its road ends has Node Controller settings.
+func has_node_settings(node_id: int) -> bool:
+	var node := get_node_data(node_id)
+	if node == null:
+		return false
+	if node.mode != NodeMode.AUTO:
+		return true
+	for sid in node.segment_ids:
+		if not (segments[sid] as RoadSegment).settings_at(node_id).is_default():
+			return true
+	return false
+
+
+## Back to automatic: mode and every road end's settings.
+func reset_node(node_id: int) -> void:
+	var node := get_node_data(node_id)
+	if node == null:
+		return
+	node.mode = NodeMode.AUTO
+	for sid in node.segment_ids:
+		_apply_end_settings(segments[sid], node_id, EndSettings.new())
+	_dirty_nodes[node_id] = true
+	_rebuild_dirty()
+	changed.emit()
+
+
+## The node's mode and road end settings, for paste_node_settings.
+func copy_node_settings(node_id: int) -> Dictionary:
+	var node := get_node_data(node_id)
+	if node == null:
+		return {}
+	var ends: Array[EndSettings] = []
+	for e in _segment_ends(node):
+		ends.append((e.settings as EndSettings).copy())
+	return {"mode": node.mode, "ends": ends}
+
+
+## Applies copied settings, matching road ends by their order around the node.
+func paste_node_settings(node_id: int, data: Dictionary) -> void:
+	var node := get_node_data(node_id)
+	if node == null or data.is_empty():
+		return
+	node.mode = data.mode
+	var copied: Array = data.ends
+	var ends := _segment_ends(node)
+	for i in ends.size():
+		var s: EndSettings = (copied[i] as EndSettings).copy() if i < copied.size() else EndSettings.new()
+		_apply_end_settings(ends[i].seg, node_id, s)
+	_dirty_nodes[node_id] = true
+	_rebuild_dirty()
+	changed.emit()
+
+
+## Road ends at a node in order around it, for drawing handles. Each entry:
+##   segment_id, settings (copy), half (half width at the end), trim, skew,
+##   center / left / right: cut center and corners (Vector3),
+##   out / out_left / out_right: outward directions there, side: right of out,
+##   curb: corner toward the next end, {} or {x, mid, bisector (Vector3), radius,
+##         factor (distance x -> mid per meter of radius)}.
+func node_end_info(node_id: int) -> Array[Dictionary]:
+	var result: Array[Dictionary] = []
+	var node := get_node_data(node_id)
+	if node == null or node.segment_ids.size() < 2:
+		return result
+	for e: Dictionary in _junction_shape(node).ends:
+		var seg: RoadSegment = e.seg
+		var info := {
+			"segment_id": seg.id,
+			"type_name": seg.type.display_name,
+			"settings": (e.settings as EndSettings).copy(),
+			"half": e.half,
+			"trim": seg.trim_start if e.at_start else seg.trim_end,
+			"skew": seg.skew_start if e.at_start else seg.skew_end,
+			"center": _to_3d(e.center),
+			"left": _to_3d(e.left),
+			"right": _to_3d(e.right),
+			"out": _dir_3d(e.out),
+			"out_left": _dir_3d(e.out_left),
+			"out_right": _dir_3d(e.out_right),
+			"side": _dir_3d(Vector2(-(e.out as Vector2).y, (e.out as Vector2).x)),
+			"curb": {},
+		}
+		var curb: Dictionary = e.curb
+		if not curb.is_empty():
+			info.curb = {"x": _to_3d(curb.x), "mid": _to_3d(curb.mid), "bisector": _dir_3d(curb.bisector),
+				"radius": curb.radius, "factor": curb.factor}
+		result.append(info)
+	return result
+
+
+## Moves one corner of a road end onto `target` by shifting the end sideways
+## and pulling that corner back or forward (the other corner keeps its distance).
+## `side`: -1 = left corner, 1 = right corner (looking outward from the node).
+## If the target is a corner of another road end at this node (`target_segment`,
+## `target_side`), that corner is held in place: its road's automatic trim would
+## otherwise move when this end moves.
+func align_corner(node_id: int, segment_id: int, side: int, target: Vector3,
+		target_segment: int = -1, target_side: int = 0) -> void:
+	var node := get_node_data(node_id)
+	var seg := get_segment(segment_id)
+	if node == null or seg == null or not node.segment_ids.has(segment_id):
+		return
+	var hold := get_segment(target_segment) if target_segment != segment_id else null
+	if hold != null and not node.segment_ids.has(target_segment):
+		hold = null
+	var goal := _flat(target)
+	for _i in 20:
+		var moved := _move_corner_toward(node, seg, side, goal, true)
+		if hold != null:
+			moved = _move_corner_toward(node, hold, target_side, goal, false) or moved
+		if not moved:
+			break
+	_rebuild_dirty()
+	changed.emit()
+
+
+## One step of align_corner: changes a road end's settings so its corner moves
+## onto `goal` (sideways too if `allow_shift`). Returns false if already there.
+func _move_corner_toward(node: RoadNode, seg: RoadSegment, side: int, goal: Vector2, allow_shift: bool) -> bool:
+	var end: Dictionary = {}
+	for e: Dictionary in _junction_shape(node).ends:
+		if (e.seg as RoadSegment).id == seg.id:
+			end = e
+	var corner: Vector2 = end.right if side > 0 else end.left
+	var out: Vector2 = end.out_right if side > 0 else end.out_left
+	var diff := goal - corner
+	var along := diff.dot(out)
+	var across := diff.dot(Vector2(-out.y, out.x)) if allow_shift else 0.0
+	if absf(along) < 0.002 and absf(across) < 0.002:
+		return false
+	var s := seg.settings_at(node.id).copy()
+	s.shift += across
+	s.offset += along * 0.5
+	var skew := tan(deg_to_rad(s.rotate)) + side * along / (2.0 * float(end.half))
+	s.rotate = clampf(rad_to_deg(atan(skew)), -MAX_ROTATE, MAX_ROTATE)
+	_apply_end_settings(seg, node.id, s)
+	_compute_trims(node)
+	return true
+
+
+func _apply_end_settings(seg: RoadSegment, node_id: int, settings: EndSettings) -> void:
+	var shift_delta := settings.shift - seg.settings_at(node_id).shift
+	if node_id == seg.start_id:
+		seg.start_settings = settings.copy()
+	else:
+		seg.end_settings = settings.copy()
+	if absf(shift_delta) > 1e-6:
+		var move := outward_direction(node_id, seg.id).cross(Vector3.UP).normalized() * shift_delta
+		if node_id == seg.start_id:
+			seg.start_offset += move
+		else:
+			seg.end_offset += move
+		_update_segment_curve(seg)
+	_dirty_nodes[seg.start_id] = true
+	_dirty_nodes[seg.end_id] = true
+
+
+## Offset of a road end from its node caused by its shift setting.
+func _shift_vector(seg: RoadSegment, node_id: int) -> Vector3:
+	return outward_direction(node_id, seg.id).cross(Vector3.UP).normalized() * seg.settings_at(node_id).shift
+
+
+## Moves the curve's end points to the nodes plus the segment's end offsets.
+func _update_segment_curve(seg: RoadSegment) -> void:
+	seg.curve = seg.curve.with_endpoints(get_node_data(seg.start_id).position + seg.start_offset,
+		get_node_data(seg.end_id).position + seg.end_offset)
+
+
+static func _to_3d(p: Vector2) -> Vector3:
+	return Vector3(p.x, ROAD_Y, p.y)
+
+
+static func _dir_3d(d: Vector2) -> Vector3:
+	return Vector3(d.x, 0.0, d.y)
+
+
 ## Path a vehicle takes through a junction from one lane to another.
 static func connection_curve(from: LaneEnd, to: LaneEnd) -> RoadCurve:
 	# Handle length scales with the gap, so a zero-length connection (lanes that
@@ -452,15 +755,16 @@ static func connection_curve(from: LaneEnd, to: LaneEnd) -> RoadCurve:
 func lane_points(segment_id: int, lane_index: int, spacing: float = 2.0) -> PackedVector3Array:
 	var seg: RoadSegment = segments[segment_id]
 	var lane: RoadType.LaneDef = seg.type.lanes[lane_index]
-	var from := seg.trim_start
-	var to := seg.curve.get_length() - seg.trim_end
+	var from := _lane_end_distance(seg, seg.start_id, lane.offset)
+	var to := _lane_end_distance(seg, seg.end_id, lane.offset)
 	var pts := PackedVector3Array()
 	if to - from < 0.01:
 		return pts
 	var steps := maxi(1, ceili((to - from) / spacing))
 	for i in steps + 1:
-		var t := seg.curve.t_at_distance(lerpf(from, to, float(i) / steps))
-		var p := seg.curve.point(t) + seg.curve.tangent(t).cross(Vector3.UP).normalized() * lane.offset
+		var d := lerpf(from, to, float(i) / steps)
+		var t := seg.curve.t_at_distance(d)
+		var p := seg.curve.point(t) + seg.curve.tangent(t).cross(Vector3.UP).normalized() * lane.offset * seg.width_scale(d)
 		p.y = ROAD_Y
 		pts.append(p)
 	if not lane.forward:
@@ -468,10 +772,10 @@ func lane_points(segment_id: int, lane_index: int, spacing: float = 2.0) -> Pack
 	return pts
 
 
-func _default_outs(incoming: LaneEnd, ends: Array[LaneEnd]) -> Array:
+func _default_outs(incoming: LaneEnd, ends: Array[LaneEnd], allow_u_turn: bool = false) -> Array:
 	var outs := []
 	for e in ends:
-		if not e.incoming and e.segment_id != incoming.segment_id:
+		if not e.incoming and (e.segment_id != incoming.segment_id or allow_u_turn):
 			outs.append(e.key)
 	if outs.is_empty():
 		# Dead end: allow turning around.
@@ -617,6 +921,7 @@ func _segment_ends(node: RoadNode) -> Array[Dictionary]:
 	var ends: Array[Dictionary] = []
 	for sid in node.segment_ids:
 		var seg: RoadSegment = segments[sid]
+		var settings := seg.settings_at(node.id)
 		var dir := outward_direction(node.id, sid)
 		var d2 := Vector2(dir.x, dir.z).normalized()
 		var right := Vector2(-d2.y, d2.x)  # points toward increasing angle
@@ -627,14 +932,17 @@ func _segment_ends(node: RoadNode) -> Array[Dictionary]:
 			angle += TAU
 		ends.append({
 			"seg": seg,
+			"settings": settings,
 			"at_start": seg.start_id == node.id,
 			"dir": d2,
 			"right": right,
 			"origin": origin,  # where the segment's center line starts, relative to the node
 			"lateral": origin.dot(right),
-			"half": seg.type.width * 0.5,
+			"base_half": seg.type.width * 0.5,
+			"half": seg.type.width * 0.5 * (1.0 + settings.stretch),
 			"angle": angle,
-			"trim": 0.0,
+			"hit": 0.0,
+			"need": 0.0,
 		})
 	# Parallel roads side by side (e.g. one-ways on both lanes) sort by lateral position.
 	ends.sort_custom(func(a: Dictionary, b: Dictionary) -> bool:
@@ -644,10 +952,18 @@ func _segment_ends(node: RoadNode) -> Array[Dictionary]:
 	return ends
 
 
-## Cuts segment ends back far enough that neighboring roads don't overlap.
+## Cuts segment ends back far enough that neighboring roads don't overlap,
+## then applies the Node Controller settings (offset, rotate, curb radius).
 func _compute_trims(node: RoadNode) -> void:
 	var ends := _segment_ends(node)
 	var n := ends.size()
+	var mode := effective_mode(node.id)
+	for e in ends:
+		var seg: RoadSegment = e.seg
+		if mode == NodeMode.MIDDLE:
+			_set_trim(seg, e.at_start, 0.0, 0.0)
+	if mode == NodeMode.MIDDLE:
+		return
 	if n >= 2:
 		for i in n:
 			var a := ends[i]
@@ -655,53 +971,155 @@ func _compute_trims(node: RoadNode) -> void:
 			# a's right edge faces b's left edge.
 			var hit: Variant = _line_intersection(a.origin + a.right * a.half, a.dir, b.origin - b.right * b.half, b.dir)
 			if hit != null and hit.x > 0.0 and hit.y > 0.0:
-				a.trim = maxf(a.trim, hit.x)
-				b.trim = maxf(b.trim, hit.y)
+				a.hit = maxf(a.hit, hit.x)
+				b.hit = maxf(b.hit, hit.y)
+				# A custom curb radius needs room for the curve before the roads start.
+				var radius: float = (a.settings as EndSettings).radius
+				if radius >= 0.0:
+					var t := _fillet_tangent(radius, a.dir, b.dir)
+					a.need = maxf(a.need, hit.x + t)
+					b.need = maxf(b.need, hit.y + t)
 	var margin := JUNCTION_MARGIN if n >= 3 else 0.0
 	# Centered roads of different widths get a taper; a road snapped to a lane doesn't need one.
-	var width_change := n == 2 and absf(ends[0].half - ends[1].half) > 0.01 \
+	var width_change := n == 2 and absf(ends[0].base_half - ends[1].base_half) > 0.01 \
 		and (ends[0].origin as Vector2).length() < 0.05 and (ends[1].origin as Vector2).length() < 0.05
 	for e in ends:
-		var trim: float = e.trim + margin
-		if width_change:
-			trim = maxf(trim, 3.0)  # room for a taper between different widths
+		var s: EndSettings = e.settings
 		var seg: RoadSegment = e.seg
-		trim = minf(trim, seg.curve.get_length() * MAX_TRIM_FRACTION)
-		if e.at_start:
-			seg.trim_start = trim
-		else:
-			seg.trim_end = trim
+		var base := maxf(e.hit + margin, e.need)
+		if width_change:
+			base = maxf(base, 3.0)  # room for a taper between different widths
+		if mode == NodeMode.STRETCH:
+			base = maxf(base, STRETCH_NODE_LENGTH)
+		var skew := tan(deg_to_rad(clampf(s.rotate, -MAX_ROTATE, MAX_ROTATE)))
+		# Keep both corners of a slanted end on the road.
+		var reach: float = e.half * absf(skew)
+		var max_trim := seg.curve.get_length() * MAX_TRIM_FRACTION
+		var trim := clampf(base + s.offset, reach, maxf(max_trim - reach, reach))
+		_set_trim(seg, e.at_start, trim, skew)
 
 
-func _build_junction_mesh(node: RoadNode) -> void:
+static func _set_trim(seg: RoadSegment, at_start: bool, trim: float, skew: float) -> void:
+	if at_start:
+		seg.trim_start = trim
+		seg.skew_start = skew
+	else:
+		seg.trim_end = trim
+		seg.skew_end = skew
+
+
+## Distance from the corner where two edges meet (running along `da` and `db`)
+## to where a curb of `radius` touches them.
+static func _fillet_tangent(radius: float, da: Vector2, db: Vector2) -> float:
+	var half_angle := clampf(absf(da.angle_to(db)), 0.05, PI - 0.05) * 0.5
+	return radius / tan(half_angle)
+
+
+## Each road end at a node (sorted by angle) with its corners, and the junction
+## outline. Per end: seg, settings, at_start, half, center (cut center),
+## out (outward direction there), left / right corners with out_left / out_right,
+## and curb: the corner toward the next end ({} if its edges don't meet):
+## {x: where the edges meet, mid: middle of the curb, bisector, radius}.
+func _junction_shape(node: RoadNode) -> Dictionary:
 	var ends := _segment_ends(node)
 	var n := ends.size()
-	var mesh: ArrayMesh = null
-	if n >= 2:
-		var corners: Array = []  # [left, right, outward dir] per end
-		for e in ends:
-			var seg: RoadSegment = e.seg
-			var t := seg.curve.t_at_distance(seg.trim_start if e.at_start else seg.curve.get_length() - seg.trim_end)
+	for e in ends:
+		var seg: RoadSegment = e.seg
+		for side: float in [-1.0, 0.0, 1.0]:
+			var d := seg.distance_from_end(node.id, seg.trim_at(node.id, side * e.half))
+			var t := seg.curve.t_at_distance(d)
 			var q := seg.curve.point(t)
 			var out := seg.curve.tangent(t) * (1.0 if e.at_start else -1.0)
 			var o2 := Vector2(out.x, out.z).normalized()
-			var r2 := Vector2(-o2.y, o2.x) * float(e.half)
-			corners.append([Vector2(q.x, q.z) - r2, Vector2(q.x, q.z) + r2, o2])
-		var poly := PackedVector2Array()
+			var half := seg.type.width * 0.5 * seg.width_scale(d)
+			var p := Vector2(q.x, q.z) + Vector2(-o2.y, o2.x) * side * half
+			if side < 0.0:
+				e.left = p
+				e.out_left = o2
+			elif side > 0.0:
+				e.right = p
+				e.out_right = o2
+			else:
+				e.center = p
+				e.out = o2
+		e.curb = {}
+	var poly := PackedVector2Array()
+	if n >= 2:
 		for i in n:
-			var a: Array = corners[i]
-			var b: Array = corners[(i + 1) % n]
-			_append_unique(poly, a[0])
-			_append_unique(poly, a[1])
+			var a := ends[i]
+			var b := ends[(i + 1) % n]
+			_append_unique(poly, a.left)
+			_append_unique(poly, a.right)
 			# Round the corner between a's right edge and b's left edge.
-			var hit: Variant = _line_intersection(a[1], a[2], b[0], b[2])
-			if hit != null and hit.x < 0.0 and hit.y < 0.0:
-				var ctrl: Vector2 = a[1] + a[2] * hit.x
+			var hit: Variant = _line_intersection(a.right, a.out_right, b.left, b.out_left)
+			if hit == null or hit.x >= 0.0 or hit.y >= 0.0:
+				continue
+			var x: Vector2 = a.right + a.out_right * hit.x
+			var radius: float = (a.settings as EndSettings).radius
+			var pts := PackedVector2Array()
+			if radius >= 0.0:
+				pts = _fillet_points(x, a.out_right, b.out_left, radius, -hit.x, -hit.y)
+			else:
 				for k in range(1, 6):
 					var f := k / 6.0
-					_append_unique(poly, (a[1] as Vector2).lerp(ctrl, f).lerp(ctrl.lerp(b[0], f), f))
+					pts.append((a.right as Vector2).lerp(x, f).lerp(x.lerp(b.left, f), f))
+			for p in pts:
+				_append_unique(poly, p)
+			var bisector := ((a.out_right as Vector2) + (b.out_left as Vector2)).normalized()
+			a.curb = {"x": x, "mid": _curb_middle(pts, x, bisector), "bisector": bisector, "radius": radius,
+				"factor": _curb_factor(a.out_right, b.out_left)}
 		if poly.size() > 2 and poly[0].distance_to(poly[poly.size() - 1]) < 0.01:
 			poly.remove_at(poly.size() - 1)
+	return {"ends": ends, "poly": poly}
+
+
+## Points of a circular curb of `radius` between two edges that meet at `x`,
+## running out along `ua` and `ub` (shrunk to fit within `max_a` / `max_b`).
+static func _fillet_points(x: Vector2, ua: Vector2, ub: Vector2, radius: float, max_a: float, max_b: float) -> PackedVector2Array:
+	var pts := PackedVector2Array()
+	var phi := absf(ua.angle_to(ub))
+	if phi > PI - 0.05 or phi < 0.05:
+		return pts
+	var half_phi := phi * 0.5
+	var t := minf(radius / tan(half_phi), minf(max_a, max_b))
+	var r := t * tan(half_phi)
+	var pa := x + ua * t
+	var pb := x + ub * t
+	pts.append(pa)
+	if r > 0.01:
+		var c := x + (ua + ub).normalized() * (r / sin(half_phi))
+		var a0 := (pa - c).angle()
+		var sweep := wrapf((pb - c).angle() - a0, -PI, PI)
+		for k in range(1, 10):
+			pts.append(c + Vector2.from_angle(a0 + sweep * k / 10.0) * r)
+	pts.append(pb)
+	return pts
+
+
+## The curb point closest to the corner `x` along the bisector (its middle).
+static func _curb_middle(pts: PackedVector2Array, x: Vector2, bisector: Vector2) -> Vector2:
+	if pts.is_empty():
+		return x
+	var best := pts[0]
+	var best_d := INF
+	for p in pts:
+		var d := (p - x).dot(bisector)
+		if d < best_d:
+			best_d = d
+			best = p
+	return best
+
+
+## Distance from the corner to the middle of a curb, per meter of curb radius.
+static func _curb_factor(ua: Vector2, ub: Vector2) -> float:
+	var half_phi := clampf(absf(ua.angle_to(ub)), 0.05, PI - 0.05) * 0.5
+	return 1.0 / sin(half_phi) - 1.0
+
+
+func _build_junction_mesh(node: RoadNode) -> void:
+	var mesh: ArrayMesh = null
+	if node.segment_ids.size() >= 2 and effective_mode(node.id) != NodeMode.MIDDLE:
+		var poly: PackedVector2Array = _junction_shape(node).poly
 		if poly.size() >= 3 and absf(_polygon_area(poly)) > 0.05:
 			mesh = RoadMeshBuilder.build_polygon(poly, ROAD_Y)
 	node.mesh_instance = _apply_mesh(node.mesh_instance, mesh)
@@ -745,11 +1163,20 @@ func _update_lane_mismatch(node: RoadNode) -> void:
 
 
 func _build_segment_mesh(seg: RoadSegment) -> void:
-	var from := seg.trim_start
-	var to := seg.curve.get_length() - seg.trim_end
+	var length := seg.curve.get_length()
+	var half_start := seg.type.width * 0.5 * seg.width_scale(seg.trim_start)
+	var half_end := seg.type.width * 0.5 * seg.width_scale(length - seg.trim_end)
+	# Each side starts and ends where the (possibly slanted) end edges cross it.
+	# At the end node, the segment's right side is the left side looking outward.
+	var from_l := seg.trim_start - half_start * seg.skew_start
+	var from_r := seg.trim_start + half_start * seg.skew_start
+	var to_l := length - (seg.trim_end + half_end * seg.skew_end)
+	var to_r := length - (seg.trim_end - half_end * seg.skew_end)
 	var mesh: ArrayMesh = null
-	if to - from > 0.01:
-		mesh = RoadMeshBuilder.build_strip(seg.curve, from, to, seg.type.width, ROAD_Y)
+	if to_l - from_l > 0.01 and to_r - from_r > 0.01:
+		var stretched := seg.start_settings.stretch != 0.0 or seg.end_settings.stretch != 0.0
+		mesh = RoadMeshBuilder.build_strip_sides(seg.curve, from_l, from_r, to_l, to_r,
+			func(d: float) -> float: return seg.type.width * 0.5 * seg.width_scale(d), ROAD_Y, stretched)
 	seg.mesh_instance = _apply_mesh(seg.mesh_instance, mesh)
 
 
