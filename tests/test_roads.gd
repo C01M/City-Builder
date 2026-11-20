@@ -17,6 +17,7 @@ func _initialize() -> void:
 	_test_curved_crossing()
 	_test_upgrade()
 	_test_lane_snapping()
+	_test_tight_exit()
 	_test_node_offset_rotate_shift()
 	_test_curb_radius()
 	_test_align_corner()
@@ -225,6 +226,91 @@ func _test_lane_snapping() -> void:
 	_check(c.get_segment(c.get_node_data(cn).segment_ids[1]).end_offset == Vector3.ZERO, "center attach has no offset")
 	net.free()
 	c.free()
+
+
+## A one-way leaving the right lane of a two-way at a small angle, with a short
+## first segment (so its end can't be cut back to where the roads separate).
+## The road surface must have no holes in the gore and pave no grass.
+func _test_tight_exit() -> void:
+	var exits := [[Vector3(4.5, 0, -6), Vector3(5.5, 0, -60), _one, Vector3(1.5, 0, 0)],
+		[Vector3(6, 0, -14), Vector3(8, 0, -60), _one, Vector3(1.5, 0, 0)],
+		[Vector3(5, 0, -8), Vector3(12, 0, -60), _two, Vector3.ZERO]]
+	for ex: Array in exits:
+		var net := _new_net()
+		net.build_road(RoadCurve.straight(Vector3(0, 0, 60), Vector3(0, 0, -60)), _two)
+		net.build_road(RoadCurve.straight(ex[3], ex[0]), ex[2], {"on_segment": true, "anchor": Vector3.ZERO})
+		net.build_road(RoadCurve.straight(ex[0], ex[1]), ex[2], {"node": net.find_node_near(ex[0], 0.5)})
+		var result := _surface_check(net)
+		_check(result.x == 0, "tight exit to %s: no holes in the road surface (%d points)" % [ex[0], result.x])
+		_check(result.y == 0, "tight exit to %s: junction paves no grass (%d points)" % [ex[0], result.y])
+		# Traffic coming down the main road can't hairpin back into the exit.
+		var n := net.find_node_near(Vector3.ZERO, 0.1)
+		var north := -1
+		var exit := -1
+		for sid in net.get_node_data(n).segment_ids:
+			var seg := net.get_segment(sid)
+			if seg.type == ex[2] and seg.start_id == n and seg.end_id != net.find_node_near(Vector3(0, 0, -60), 0.5):
+				exit = sid
+			elif seg.start_id == n:
+				north = sid
+		var exit_lanes := _outs(net, n, _incoming_key(net, n, north)).filter(
+			func(k: int) -> bool: return RoadNetwork.key_segment(k) == exit)
+		_check(exit_lanes.is_empty(), "tight exit to %s: no hairpin from the main road into the exit" % ex[0])
+		var south := -1
+		for sid in net.get_node_data(n).segment_ids:
+			if sid != north and sid != exit:
+				south = sid
+		var from_south := _outs(net, n, _incoming_key(net, n, south)).filter(
+			func(k: int) -> bool: return RoadNetwork.key_segment(k) == exit)
+		_check(not from_south.is_empty(), "tight exit to %s: traffic heading north can take the exit" % ex[0])
+		net.free()
+	# A road that bends back sharply at a node still connects.
+	var bend := _new_net()
+	bend.build_road(RoadCurve.straight(Vector3(-40, 0, 0), Vector3.ZERO), _two)
+	var b := bend.find_node_near(Vector3.ZERO, 0.1)
+	bend.build_road(RoadCurve.straight(Vector3.ZERO, Vector3(-40, 0, 15)), _two, {"node": b})
+	var first: int = bend.get_node_data(b).segment_ids[0]
+	var second: int = bend.get_node_data(b).segment_ids[1]
+	var outs := _outs(bend, b, _incoming_key(bend, b, first))
+	_check(outs.size() == 1 and RoadNetwork.key_segment(outs[0]) == second, "sharp bend: lanes still continue around it")
+	bend.free()
+
+
+## Vector2i(road points no mesh covers, junction points off every road), on a
+## 0.25 m grid around the origin.
+func _surface_check(net: RoadNetwork) -> Vector2i:
+	var polys: Array[PackedVector2Array] = []
+	for node: RoadNetwork.RoadNode in net.nodes.values():
+		if node.segment_ids.size() >= 2:
+			polys.append(net._junction_shape(node).poly)
+	var holes := 0
+	var grass := 0
+	for ix in range(-40, 81):
+		for iz in range(-120, 41):
+			var p := Vector3(ix * 0.25, 0, iz * 0.25)
+			var road := false
+			var near_road := false
+			var covered := false
+			for seg: RoadNetwork.RoadSegment in net.segments.values():
+				var t := seg.curve.closest_t(p)
+				var q := seg.curve.point(t)
+				var lat := Vector2(p.x - q.x, p.z - q.z).length()
+				var half := seg.type.width * 0.5
+				near_road = near_road or lat < half + 0.3
+				if t <= 0.001 or t >= 0.999:
+					continue
+				var d := seg.curve.distance_at_t(t)
+				road = road or lat < half - 0.15
+				if lat < half + 0.05 and d >= seg.trim_start - 0.1 and d <= seg.curve.get_length() - seg.trim_end + 0.1:
+					covered = true
+			var in_poly := false
+			for poly in polys:
+				in_poly = in_poly or Geometry2D.is_point_in_polygon(Vector2(p.x, p.z), poly)
+			if in_poly and not near_road:
+				grass += 1
+			if road and not covered and not in_poly:
+				holes += 1
+	return Vector2i(holes, grass)
 
 
 # ---------------------------------------------------------------- node controller

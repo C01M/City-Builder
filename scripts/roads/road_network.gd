@@ -22,6 +22,8 @@ const WARNING_ICON_HEIGHT := 5.0
 const MAX_ROTATE := 70.0
 ## Road length used for the width transition at a STRETCH node.
 const STRETCH_NODE_LENGTH := 12.0
+## Default lane connections skip turns sharper than this (degrees; U-turn = 180).
+const MAX_DEFAULT_TURN := 135.0
 
 ## How a node joins its roads (Node Controller). MIDDLE and STRETCH only apply
 ## to nodes with exactly two roads; elsewhere they act like AUTO.
@@ -774,9 +776,17 @@ func lane_points(segment_id: int, lane_index: int, spacing: float = 2.0) -> Pack
 
 func _default_outs(incoming: LaneEnd, ends: Array[LaneEnd], allow_u_turn: bool = false) -> Array:
 	var outs := []
+	var gentle := []
+	var min_dot := cos(deg_to_rad(MAX_DEFAULT_TURN))
 	for e in ends:
 		if not e.incoming and (e.segment_id != incoming.segment_id or allow_u_turn):
 			outs.append(e.key)
+			if e.segment_id == incoming.segment_id or _flat(incoming.direction).normalized().dot(_flat(e.direction).normalized()) >= min_dot:
+				gentle.append(e.key)
+	# Leave out hairpins (e.g. from the main road back into a tight exit), unless
+	# that's the only way on (a road that bends back sharply at a node).
+	if not gentle.is_empty():
+		return gentle
 	if outs.is_empty():
 		# Dead end: allow turning around.
 		for e in ends:
@@ -1044,6 +1054,7 @@ func _junction_shape(node: RoadNode) -> Dictionary:
 				e.out = o2
 		e.curb = {}
 	var poly := PackedVector2Array()
+	var center := _flat(node.position)
 	if n >= 2:
 		for i in n:
 			var a := ends[i]
@@ -1052,9 +1063,19 @@ func _junction_shape(node: RoadNode) -> Dictionary:
 			_append_unique(poly, a.right)
 			# Round the corner between a's right edge and b's left edge.
 			var hit: Variant = _line_intersection(a.right, a.out_right, b.left, b.out_left)
-			if hit == null or hit.x >= 0.0 or hit.y >= 0.0:
+			if hit == null:
 				continue
 			var x: Vector2 = a.right + a.out_right * hit.x
+			if (hit.x < 0.0) != (hit.y < 0.0):
+				# Tight angle where one end couldn't be cut back far enough (short
+				# segment): the edges cross past that end. Follow both edges to the
+				# crossing so the gore between them stays paved.
+				var reach := maxf((a.right as Vector2).distance_to(center), (b.left as Vector2).distance_to(center))
+				if (a.out_right as Vector2).dot(b.out_left) > 0.0 and x.distance_to(center) <= reach + 0.5:
+					_append_unique(poly, x)
+				continue
+			if hit.x >= 0.0:
+				continue
 			var radius: float = (a.settings as EndSettings).radius
 			var pts := PackedVector2Array()
 			if radius >= 0.0:
