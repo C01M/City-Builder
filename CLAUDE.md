@@ -5,6 +5,7 @@
 - Godot executable: `E:\Godot\Godot_v4.7.2-stable_win64.exe`
   - This is the GUI build, so it doesn't print to the terminal. Use `--log-file` to capture output.
   - `E:\Godot\Godot_v4.7.2-stable_win64_console.exe` is the console build, which prints to the terminal.
+- Window: borderless fullscreen (`window/size/mode=3`) with a 1920×1080 base size; `canvas_items` stretch scales the UI to the screen.
 - Main scene: `res://scenes/main.tscn`, a flat 2 km × 2 km grass plain (centered on the origin, ground at y=0) with a sun, sky and an RTS camera (`scripts/camera_rig.gd`: WASD/arrows pan, wheel zoom, middle mouse rotate).
 
 ## Road system (`scripts/roads/`)
@@ -34,10 +35,13 @@ Node/segment graph with lane-level connections (Cities: Skylines style). Traffic
 ## Traffic (`scripts/traffic/`)
 
 - Outside connections: dead-end nodes on the map border (within 3 m of ±`map_half_size`). The road tool snaps ends within 8 m of the edge onto it. Each lane leaving one spawns cars (slider: cars/min per entry lane) that route to a random other outside connection.
-- `traffic_graph.gd`: `TrafficGraph`, rebuilt from the network on every `changed`. It has lane pieces and junction connection pieces (polylines with per-point curve speed limits from `LATERAL_ACCEL`), Dijkstra routing with a cache, and per-junction `conflicts` (paths that cross, come too close, share an exit lane, or diverge from the same entry lane).
-- `traffic_manager.gd`: `TrafficManager`. Cars use IDM car following (70 km/h, 5 m/s² accel, 6 m/s² comfortable braking, 18 m/s² max braking, 1.2 s headway) plus anticipatory braking for curves and junctions ahead. At junctions with conflicts a car must reserve its path (first come, first served; exit lane must have room); until then it approaches at ≤ 20 km/h, asks within 35 m, and ignores cars beyond the stop line. Reservations are released once the car's tail leaves the junction. On network changes, cars are projected onto the new graph and re-routed, or removed.
+- `traffic_graph.gd`: `TrafficGraph`, rebuilt from the network on every `changed`. It has lane pieces and junction connection pieces (polylines with per-point curve speed limits from `LATERAL_ACCEL` = 7 m/s²), Dijkstra routing with a cache, and conflict zones: for each pair of paths through a junction that come within `ZONE_DISTANCE` (2.8 m) of each other, cross, share an exit lane or split from the same entry lane, the stretch of each path involved (`Piece.zones`, sorted by start; `conflicts` lists the other pieces).
+- `traffic_manager.gd`: `TrafficManager`. Cars use IDM car following (70 km/h, 5 m/s² accel, 6 m/s² comfortable braking, 18 m/s² max braking, 1.2 s headway) plus anticipatory braking for curves and junctions ahead.
+  - Junctions: within 35 m a car queues for every conflict zone on its path (`_request`), commits to entering only if the exit lane has room, then reserves zones in order along the path (`_junction_stop`). A zone side is free if nobody holds the other side and nobody who asked earlier is queued for it, so waits always point to earlier cars and can't form a circle. The car drives up to just before the first zone it can't reserve and waits there, inside the junction if that's where it is (e.g. a left turn waiting at the oncoming lane). Until everything is reserved it approaches its stop point at ≤ 35 km/h and ignores cars beyond it. A zone is released once the car's tail has passed it.
+  - Cars also follow a car that turned off their lane onto another path while its tail is still in the lane.
+  - On network changes, cars are projected onto the new graph and re-routed, or removed.
 - `step(delta)` drives the simulation (called from `_physics_process`) and works without the scene tree, so tests call it directly.
-- An unsignalized 4-way carries roughly 20–25 cars/min, similar to an all-way stop. Higher demand queues back to the entries, where spawning waits.
+- An unsignalized 4-way carries roughly 30 cars/min. Higher demand queues back to the entries, where spawning waits.
 
 ## Tests
 
@@ -50,7 +54,7 @@ Node/segment graph with lane-level connections (Cities: Skylines style). Traffic
 ## Rendering a test frame
 
 - The project uses Vulkan on Windows (`rendering_device/driver.windows="vulkan"`) because D3D12 crashed on this machine (Intel UHD 770). Don't switch it back.
-- Render frames with `--write-movie <dir>\f.png --quit-after 30` (no `--headless`). This opens a window, and user input in it changes the frame, so a strange camera view may just be the user moving it.
+- Render frames with `--write-movie <dir>\f.png --quit-after 30` (no `--headless`). Frames come out at 1920×1080. This opens a fullscreen window, and user input in it changes the frame, so a strange camera view may just be the user moving it.
 
 ## Checking work
 

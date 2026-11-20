@@ -5,6 +5,8 @@ extends SceneTree
 
 const DT := 1.0 / 30.0
 const HALF := 200.0
+## A car whose front is this far past the stop line is inside the junction.
+const CAR_INSIDE := 5.0
 
 var _failures := 0
 var _two: RoadType
@@ -44,7 +46,7 @@ func _setup(rate: float) -> Array:
 
 ## Runs the simulation, tracking limits and checking for overlapping cars.
 func _run(traffic: TrafficManager, seconds: float, stats: Dictionary = {}) -> Dictionary:
-	for key in ["max_speed", "max_accel", "min_accel", "overlaps", "max_cars"]:
+	for key in ["max_speed", "max_accel", "min_accel", "overlaps", "max_cars", "inside_waits"]:
 		if not stats.has(key):
 			stats[key] = 0.0
 	for i in int(seconds / DT):
@@ -54,6 +56,9 @@ func _run(traffic: TrafficManager, seconds: float, stats: Dictionary = {}) -> Di
 			stats.max_speed = maxf(stats.max_speed, car.v)
 			stats.max_accel = maxf(stats.max_accel, car.accel)
 			stats.min_accel = minf(stats.min_accel, car.accel)
+			# Stopped well inside a junction, waiting for crossing traffic.
+			if car.v < 0.3 and car.s > CAR_INSIDE and traffic.graph.pieces[car.route[car.index]].is_connection:
+				stats.inside_waits += 1
 		if i % 3 == 0:
 			stats.overlaps += _count_overlaps(traffic)
 	return stats
@@ -163,6 +168,7 @@ func _test_edited_crossing() -> void:
 				longer += 1
 	_check(total == 12 and longer == 12, "edited crossing: wider curbs lengthen all 12 paths (%d of %d)" % [longer, total])
 	_check(traffic.completed_trips >= 40, "edited crossing: traffic flows (%d trips)" % traffic.completed_trips)
+	_check(stats.inside_waits > 0, "edited crossing: cars pull into the junction to wait for crossing traffic")
 	_check_limits(stats, "edited crossing")
 	net.free()
 	traffic.free()

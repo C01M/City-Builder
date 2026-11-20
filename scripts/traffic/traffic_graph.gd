@@ -5,9 +5,10 @@ extends RefCounted
 ## Rebuilt whenever the network changes.
 
 ## Comfortable sideways acceleration in curves (m/s²); sets curve speed limits.
-const LATERAL_ACCEL := 3.0
-## Junction paths closer than this (m) can't be driven at the same time.
-const CONFLICT_DISTANCE := 2.2
+const LATERAL_ACCEL := 7.0
+## Where junction paths come closer than this (m, center line to center line),
+## cars on them could touch: that stretch of both paths is a conflict zone.
+const ZONE_DISTANCE := 2.8
 ## Road ends this close to the map edge count as outside connections.
 const BORDER_TOLERANCE := 3.0
 
@@ -29,8 +30,11 @@ class Piece:
 	var speed_limit := PackedFloat32Array()
 	var length: float = 0.0
 	var next: Array[int] = []
-	## Connection pieces at the same junction that can't be used at the same time.
+	## Connection pieces at the same junction that share a conflict zone with this one.
 	var conflicts: Array[int] = []
+	## Conflict zones along this connection, sorted by start:
+	## {zone: zone id, side: 0 / 1 (which piece of the zone this is), start, end (distance along this piece)}.
+	var zones: Array[Dictionary] = []
 	var bounds: Rect2
 
 	## Index of the polyline segment containing distance `s`.
@@ -128,6 +132,8 @@ class MinHeap:
 
 
 var pieces: Array[Piece] = []
+## Number of conflict zones (ids 0 .. zone_count - 1).
+var zone_count: int = 0
 var lane_pieces: Dictionary = {}  # lane key -> piece id
 ## Dead-end nodes on the map border, where traffic enters and leaves.
 var outside_nodes: Array[int] = []
@@ -263,32 +269,55 @@ func _add_piece(pts: PackedVector3Array, max_speed: float) -> Piece:
 	return p
 
 
+## Finds where pairs of paths through a junction come close (cross, merge into the
+## same exit lane, or split from the same entry lane) and records a conflict zone
+## on both. Cars on the very same path just follow each other.
 func _find_conflicts(conns: Array[Piece]) -> void:
 	for i in conns.size():
 		for j in range(i + 1, conns.size()):
 			var a := conns[i]
 			var b := conns[j]
-			# Paths from the same lane diverge inside the junction: a turning car's
-			# tail can still block a follower going another way, so they conflict too.
-			# (Cars on the very same path just follow each other.)
-			if a.in_key == b.in_key or a.out_key == b.out_key or _paths_close(a.points, b.points):
-				a.conflicts.append(b.id)
-				b.conflicts.append(a.id)
+			var za := _close_stretch(a, b)
+			var zb := _close_stretch(b, a)
+			if za.x < 0.0 or zb.x < 0.0:
+				continue
+			# Paths from the same lane: a turning car's tail can still block a
+			# follower going another way until the paths have split.
+			if a.in_key == b.in_key:
+				za.x = 0.0
+				zb.x = 0.0
+			# Paths into the same lane: the zone runs to the lane, where cars follow.
+			if a.out_key == b.out_key:
+				za.y = a.length
+				zb.y = b.length
+			var id := zone_count
+			zone_count += 1
+			a.zones.append({"zone": id, "side": 0, "start": za.x, "end": za.y})
+			b.zones.append({"zone": id, "side": 1, "start": zb.x, "end": zb.y})
+			a.conflicts.append(b.id)
+			b.conflicts.append(a.id)
+	for p in conns:
+		p.zones.sort_custom(func(x: Dictionary, y: Dictionary) -> bool: return x.start < y.start)
 
 
-static func _paths_close(a: PackedVector3Array, b: PackedVector3Array) -> bool:
-	for i in a.size() - 1:
-		var a0 := Vector2(a[i].x, a[i].z)
-		var a1 := Vector2(a[i + 1].x, a[i + 1].z)
-		for j in b.size() - 1:
-			var b0 := Vector2(b[j].x, b[j].z)
-			var b1 := Vector2(b[j + 1].x, b[j + 1].z)
-			if Geometry2D.segment_intersects_segment(a0, a1, b0, b1) != null:
-				return true
-			if Geometry2D.get_closest_point_to_segment(a0, b0, b1).distance_to(a0) < CONFLICT_DISTANCE \
-					or Geometry2D.get_closest_point_to_segment(b0, a0, a1).distance_to(b0) < CONFLICT_DISTANCE:
-				return true
-	return false
+## Stretch of `a` (Vector2(start, end) distance along it) within ZONE_DISTANCE of
+## `b`, widened by one sample on each side. (-1, -1) if they never come close.
+static func _close_stretch(a: Piece, b: Piece) -> Vector2:
+	var lo := INF
+	var hi := -INF
+	for i in a.points.size():
+		var p := Vector2(a.points[i].x, a.points[i].z)
+		for j in b.points.size() - 1:
+			var b0 := Vector2(b.points[j].x, b.points[j].z)
+			var b1 := Vector2(b.points[j + 1].x, b.points[j + 1].z)
+			if Geometry2D.get_closest_point_to_segment(p, b0, b1).distance_to(p) < ZONE_DISTANCE:
+				lo = minf(lo, a.dist[i])
+				hi = maxf(hi, a.dist[i])
+				break
+	if lo == INF:
+		return Vector2(-1.0, -1.0)
+	var step := a.length / maxf(a.points.size() - 1, 1)
+	return Vector2(maxf(lo - step, 0.0), minf(hi + step, a.length))
 
 
 static func _circumradius(a: Vector3, b: Vector3, c: Vector3) -> float:

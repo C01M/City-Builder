@@ -23,9 +23,9 @@ const CAR_HEIGHT := 1.4
 const LOOKAHEAD := 150.0
 const MAX_CARS := 800
 const STOP_LINE_MARGIN := 0.5
-## Until a car has reserved its path through a junction with crossing traffic,
-## it approaches the stop line no faster than this (m/s, ~20 km/h)...
-const JUNCTION_APPROACH_SPEED := 6.0
+## Until a car has reserved its way through a junction with crossing traffic,
+## it approaches where it may have to stop no faster than this (m/s, ~35 km/h)...
+const JUNCTION_APPROACH_SPEED := 9.7
 ## ...and asks for the junction once it is this close (m).
 const JUNCTION_REQUEST_DISTANCE := 35.0
 const SPAWN_SPEED := 12.0
@@ -48,10 +48,15 @@ class Car:
 	var accel: float = 0.0
 	var dest_node: int = -1
 	var color: Color
-	## Route indices of junction connections this car has reserved.
-	var granted: Dictionary = {}
-	var requested_piece: int = -1
+	## Junction path (route index) whose conflict zones the car is queued for, and since when.
+	var request_k: int = -1
 	var request_time: float = 0.0
+	## Zones queued for: zone id -> side.
+	var pending: Dictionary = {}
+	## Zones reserved: {zone, side, k (route index of the junction path), end (zone end along it)}.
+	var held: Array[Dictionary] = []
+	## Junction paths the car may enter because their exit lane had room: route index -> piece id.
+	var committed: Dictionary = {}
 	var front_pos := Vector3.ZERO
 	var heading := Vector3.FORWARD
 	## What limited the car most this step: "free", "curve", "leader", "junction" (for debugging).
@@ -72,8 +77,11 @@ var _time := 0.0
 var _next_car_id := 1
 var _dirty := true
 var _spawn_due: Dictionary = {}  # entry piece id -> time of next spawn
-var _reserved: Dictionary = {}  # connection piece id -> Array of Car
-var _pending: Dictionary = {}  # connection piece id -> Array of Car waiting
+## Per conflict zone id: [cars holding side 0, cars holding side 1].
+var _zone_holders: Array = []
+## Per conflict zone id: [cars queued for side 0, cars queued for side 1].
+var _zone_pending: Array = []
+var _entering: Dictionary = {}  # connection piece id -> Array of Car committed to it
 var _piece_cars: Dictionary = {}  # piece id -> Array of Car, sorted by s
 var _multimesh: MultiMesh
 var _markers: MeshInstance3D
@@ -150,8 +158,12 @@ func _on_network_changed() -> void:
 func _rebuild_graph() -> void:
 	_dirty = false
 	graph = TrafficGraph.build(network, map_half_size, MAX_SPEED)
-	_reserved.clear()
-	_pending.clear()
+	_zone_holders.clear()
+	_zone_pending.clear()
+	for i in graph.zone_count:
+		_zone_holders.append([[], []])
+		_zone_pending.append([[], []])
+	_entering.clear()
 	_piece_cars.clear()
 	_spawn_due.clear()
 	var kept: Array[Car] = []
@@ -184,11 +196,18 @@ func _relocate(car: Car) -> bool:
 	car.route = route
 	car.index = 0
 	car.s = best_s
-	car.granted.clear()
-	car.requested_piece = -1
+	car.held.clear()
+	car.pending.clear()
+	car.committed.clear()
+	car.request_k = -1
 	var piece := graph.pieces[best_piece]
 	if piece.is_connection:
-		_grant(car, piece, 0)
+		# Already inside the junction: it takes the zones it still has to pass.
+		car.committed[0] = piece.id
+		_entering_list(piece.id).append(car)
+		for z: Dictionary in piece.zones:
+			if car.s - CAR_LENGTH <= z.end:
+				_take(car, z, 0)
 	_piece_list(best_piece).append(car)
 	return true
 
@@ -276,6 +295,8 @@ func _acceleration(car: Car) -> float:
 	var to_piece := -car.s  # distance from the car's front to the start of piece k
 	var leader_found := false
 	var junction_checked := false
+	## Where the car has to stop for a junction (distance from its front).
+	var stop := INF
 	var k := car.index
 	while k < car.route.size() and to_piece < LOOKAHEAD:
 		var p := graph.pieces[car.route[k]]
@@ -289,34 +310,53 @@ func _acceleration(car: Car) -> float:
 					var vl := p.speed_limit[i]
 					v0 = minf(v0, sqrt(vl * vl + 2.0 * COMFORT_DECEL * d))
 					need = maxf(need, (v * v - vl * vl) / (2.0 * maxf(d, 0.5)))
-		# Next junction: stop at the line unless our path through it is reserved.
-		if p.is_connection and k > car.index and not junction_checked:
-			junction_checked = true
-			if not p.conflicts.is_empty() and not car.granted.has(k):
-				var to_line := maxf(to_piece - STOP_LINE_MARGIN, 0.0)
-				if to_line >= JUNCTION_REQUEST_DISTANCE or not _try_reserve(car, p, k):
-					# We stop at the line, so cars beyond it don't matter yet.
-					leader_found = true
-					var va := JUNCTION_APPROACH_SPEED
-					approach = minf(approach, sqrt(va * va + 2.0 * COMFORT_DECEL * to_line))
-					approach_need = (v * v - va * va) / (2.0 * maxf(to_line, 0.5))
-					if to_line < JUNCTION_REQUEST_DISTANCE:
-						# A stop line needs no time gap, just room to stop.
-						var term := _idm_interaction(v, to_line, v, 0.0)
-						if term < accel:
-							accel = term
-							car.limit = "junction"
-		# Car ahead.
+		# Junction (the one we're in, then the next): drive up to the first
+		# conflict zone we can't reserve yet and wait there.
+		if p.is_connection and not p.zones.is_empty() and stop == INF and not junction_checked:
+			junction_checked = k > car.index
+			stop = _junction_stop(car, p, k, to_piece)
+			if stop < INF:
+				var va := JUNCTION_APPROACH_SPEED
+				approach = minf(approach, sqrt(va * va + 2.0 * COMFORT_DECEL * stop))
+				approach_need = (v * v - va * va) / (2.0 * maxf(stop, 0.5))
+				if stop < JUNCTION_REQUEST_DISTANCE:
+					# A stop point needs no time gap, just room to stop.
+					var term := _idm_interaction(v, stop, v, 0.0)
+					if term < accel:
+						accel = term
+						car.limit = "junction"
+		# Car ahead (cars beyond where we have to stop don't matter yet).
 		if not leader_found:
 			for other: Car in _piece_cars.get(p.id, []):
 				if other == car or (k == car.index and other.s <= car.s):
 					continue
-				var term := _idm_interaction(v, to_piece + other.s - CAR_LENGTH, v - other.v, TIME_HEADWAY)
-				if term < accel:
-					accel = term
-					car.limit = "leader"
+				var gap := to_piece + other.s - CAR_LENGTH
+				if gap <= stop:
+					var term := _idm_interaction(v, gap, v - other.v, TIME_HEADWAY)
+					if term < accel:
+						accel = term
+						car.limit = "leader"
 				leader_found = true
 				break
+			# A car that just turned off this lane onto another path through the
+			# junction may still have its tail in the lane (e.g. waiting inside).
+			if not leader_found and not p.is_connection:
+				var next_on_route := car.route[k + 1] if k + 1 < car.route.size() else -1
+				for nid in p.next:
+					var list: Array = _piece_cars.get(nid, [])
+					if nid == next_on_route or list.is_empty():
+						continue
+					var other: Car = list[0]
+					if other.s < CAR_LENGTH:
+						var gap := to_piece + p.length + other.s - CAR_LENGTH
+						if gap <= stop:
+							var term := _idm_interaction(v, gap, v - other.v, TIME_HEADWAY)
+							if term < accel:
+								accel = term
+								car.limit = "leader"
+						leader_found = true
+			if to_piece + p.length > stop:
+				leader_found = true
 		to_piece += p.length
 		k += 1
 	if accel == INF:
@@ -347,41 +387,103 @@ func _idm_interaction(v: float, gap: float, dv: float, headway: float) -> float:
 	return -MAX_ACCEL * (desired / g) * (desired / g)
 
 
-## Tries to reserve junction path `p` (route index `k`). First come, first served
-## among conflicting paths, and only if the exit lane has room.
-func _try_reserve(car: Car, p: TrafficGraph.Piece, k: int) -> bool:
-	if car.requested_piece != p.id:
-		_cancel_request(car)
-		car.requested_piece = p.id
-		car.request_time = _time
-		_pending_list(p.id).append(car)
-	for cid in p.conflicts:
-		if not (_reserved.get(cid, []) as Array).is_empty():
-			return false
-		for other: Car in _pending.get(cid, []):
-			if other.request_time < car.request_time or (other.request_time == car.request_time and other.id < car.id):
-				return false
-	# Don't block the junction: the exit lane needs room for everyone entering.
+## Where the car must stop for junction path `p` (route index `k`, starting
+## `to_piece` m ahead of its front), as a distance from its front: at the stop
+## line while it's far off or its exit lane is full, otherwise just before the
+## first conflict zone it can't reserve yet. INF if it may drive through.
+## Zones are reserved in order along the path, first come first served by the
+## time cars asked for the junction, so waiting cars never wait on each other in
+## a circle.
+func _junction_stop(car: Car, p: TrafficGraph.Piece, k: int, to_piece: float) -> float:
+	var on_piece := k == car.index
+	if not on_piece:
+		var to_line := maxf(to_piece - STOP_LINE_MARGIN, 0.0)
+		if to_line >= JUNCTION_REQUEST_DISTANCE:
+			return to_line
+		_request(car, p, k)
+		if not car.committed.has(k):
+			# Don't block the junction: the exit lane needs room for everyone entering.
+			if not _exit_has_room(p):
+				return to_line
+			car.committed[k] = p.id
+			_entering_list(p.id).append(car)
+	for z: Dictionary in p.zones:
+		if _holds(car, z.zone, k):
+			continue
+		if on_piece and car.s - CAR_LENGTH > z.end:
+			continue  # already past it
+		if on_piece and car.s >= z.start:
+			_take(car, z, k)  # already in it
+			continue
+		if not _can_take(car, z.zone, z.side):
+			return maxf(to_piece + z.start - STOP_LINE_MARGIN, 0.0)
+		_take(car, z, k)
+	return INF
+
+
+func _exit_has_room(p: TrafficGraph.Piece) -> bool:
 	var out_cars: Array = _piece_cars.get(p.next[0], [])
-	if not out_cars.is_empty():
-		var last: Car = out_cars[0]
-		var needed := ((_reserved.get(p.id, []) as Array).size() + 1) * (CAR_LENGTH + MIN_GAP)
-		if last.s - CAR_LENGTH < needed and last.v < 2.0:
-			return false
-	_grant(car, p, k)
-	return true
+	if out_cars.is_empty():
+		return true
+	var last: Car = out_cars[0]
+	var needed := ((_entering.get(p.id, []) as Array).size() + 1) * (CAR_LENGTH + MIN_GAP)
+	return last.s - CAR_LENGTH >= needed or last.v >= 2.0
 
 
-func _grant(car: Car, p: TrafficGraph.Piece, k: int) -> void:
+## Queues the car for every conflict zone of junction path `p`.
+func _request(car: Car, p: TrafficGraph.Piece, k: int) -> void:
+	if car.request_k == k:
+		return
 	_cancel_request(car)
-	_reserved_list(p.id).append(car)
-	car.granted[k] = p.id
+	car.request_k = k
+	car.request_time = _time
+	for z: Dictionary in p.zones:
+		if not _holds(car, z.zone, k):
+			(_zone_pending[z.zone][z.side] as Array).append(car)
+			car.pending[z.zone] = z.side
 
 
 func _cancel_request(car: Car) -> void:
-	if car.requested_piece >= 0:
-		_pending_list(car.requested_piece).erase(car)
-		car.requested_piece = -1
+	for zone: int in car.pending:
+		(_zone_pending[zone][car.pending[zone]] as Array).erase(car)
+	car.pending.clear()
+	car.request_k = -1
+
+
+## A zone side is free if nobody holds the other side and nobody who asked
+## earlier is queued for it.
+func _can_take(car: Car, zone: int, side: int) -> bool:
+	if not (_zone_holders[zone][1 - side] as Array).is_empty():
+		return false
+	for other: Car in _zone_pending[zone][1 - side]:
+		if other.request_time < car.request_time or (other.request_time == car.request_time and other.id < car.id):
+			return false
+	return true
+
+
+func _take(car: Car, z: Dictionary, k: int) -> void:
+	(_zone_holders[z.zone][z.side] as Array).append(car)
+	if car.pending.has(z.zone):
+		(_zone_pending[z.zone][car.pending[z.zone]] as Array).erase(car)
+		car.pending.erase(z.zone)
+	car.held.append({"zone": z.zone, "side": z.side, "k": k, "end": z.end})
+
+
+func _holds(car: Car, zone: int, k: int) -> bool:
+	for h in car.held:
+		if h.zone == zone and h.k == k:
+			return true
+	return false
+
+
+## How far the car's tail is past the start of route piece `k` (negative before it).
+func _tail_past(car: Car, k: int) -> float:
+	if k > car.index:
+		return -INF
+	var d := car.s - CAR_LENGTH
+	for j in range(k, car.index):
+		d += graph.pieces[car.route[j]].length
+	return d
 
 
 ## Moves the car `ds` meters along its route. Returns false when it arrives.
@@ -396,14 +498,23 @@ func _advance(car: Car, ds: float) -> bool:
 		car.index += 1
 		piece = graph.pieces[car.route[car.index]]
 		_piece_list(piece.id).push_front(car)
-		# Couldn't stop in time: claim the junction anyway so others wait.
-		if piece.is_connection and not piece.conflicts.is_empty() and not car.granted.has(car.index):
-			_grant(car, piece, car.index)
-	# Release junctions once the whole car has left them.
-	for k: int in car.granted.keys():
-		if car.index > k + 1 or (car.index == k + 1 and car.s >= CAR_LENGTH):
-			_reserved_list(car.granted[k]).erase(car)
-			car.granted.erase(k)
+	# Couldn't stop in time: claim the zone anyway so others wait.
+	if piece.is_connection:
+		for z: Dictionary in piece.zones:
+			if car.s >= z.start and car.s - CAR_LENGTH <= z.end and not _holds(car, z.zone, car.index):
+				_take(car, z, car.index)
+	# Release zones once the whole car has left them, and forget junctions behind.
+	for i in range(car.held.size() - 1, -1, -1):
+		var h := car.held[i]
+		if _tail_past(car, h.k) > h.end:
+			(_zone_holders[h.zone][h.side] as Array).erase(car)
+			car.held.remove_at(i)
+	for k: int in car.committed.keys():
+		if car.index > k:
+			_entering_list(car.committed[k]).erase(car)
+			car.committed.erase(k)
+	if car.request_k >= 0 and car.index > car.request_k:
+		_cancel_request(car)
 	car.front_pos = piece.position_at(car.s)
 	car.heading = piece.direction_at(car.s)
 	return true
@@ -411,8 +522,12 @@ func _advance(car: Car, ds: float) -> bool:
 
 func _remove_car(car: Car) -> void:
 	_cancel_request(car)
-	for k: int in car.granted:
-		_reserved_list(car.granted[k]).erase(car)
+	for h in car.held:
+		(_zone_holders[h.zone][h.side] as Array).erase(car)
+	car.held.clear()
+	for k: int in car.committed:
+		_entering_list(car.committed[k]).erase(car)
+	car.committed.clear()
 	_piece_list(car.route[car.index]).erase(car)
 	cars.erase(car)
 
@@ -423,16 +538,10 @@ func _piece_list(id: int) -> Array:
 	return _piece_cars[id]
 
 
-func _reserved_list(id: int) -> Array:
-	if not _reserved.has(id):
-		_reserved[id] = []
-	return _reserved[id]
-
-
-func _pending_list(id: int) -> Array:
-	if not _pending.has(id):
-		_pending[id] = []
-	return _pending[id]
+func _entering_list(id: int) -> Array:
+	if not _entering.has(id):
+		_entering[id] = []
+	return _entering[id]
 
 
 # ---------------------------------------------------------------- queries / visuals
