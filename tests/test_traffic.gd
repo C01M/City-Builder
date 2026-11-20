@@ -20,6 +20,9 @@ func _initialize() -> void:
 	_test_crossing()
 	_test_edited_crossing()
 	_test_multi_lane()
+	_test_lane_changes()
+	_test_overtaking()
+	_test_traffic_lights()
 	_test_bend_slows_cars()
 	_test_one_way()
 	_test_network_change_while_driving()
@@ -193,6 +196,146 @@ func _test_multi_lane() -> void:
 			used_lanes[p.lane_key] = true
 	_check(used_lanes.size() == 5, "multi-lane: the widened piece has 5 lanes in the traffic graph")
 	_check_limits(stats, "multi-lane")
+	net.free()
+	traffic.free()
+
+
+## A four-lane road (2 + 2) crossing a two-way road. The right lane of each
+## approach can't turn left and the left lane can't turn right, so cars that
+## spawn in the wrong lane for their destination must change lanes first.
+func _test_lane_changes() -> void:
+	var setup := _setup(6.0)
+	var net: RoadNetwork = setup[0]
+	var traffic: TrafficManager = setup[1]
+	net.build_road(RoadCurve.straight(Vector3(-HALF, 0, 0), Vector3(HALF, 0, 0)), RoadType.get_type(&"four_lane"))
+	net.build_road(RoadCurve.straight(Vector3(0, 0, -HALF), Vector3(0, 0, HALF)), _two)
+	traffic.step(DT)
+	var g := traffic.graph
+	# Destinations each entry lane reaches without changing lanes.
+	var direct := {}
+	var multi_entries := 0
+	for node_id in g.outside_nodes:
+		for entry: int in g.entry_pieces[node_id]:
+			if not g.pieces[entry].beside.is_empty():
+				multi_entries += 1
+			var seen := {entry: true}
+			var todo: Array[int] = [entry]
+			var dests := {}
+			while not todo.is_empty():
+				var p := g.pieces[todo.pop_back()]
+				if not p.is_connection and g.exit_pieces.has(p.node_id):
+					dests[p.node_id] = true
+				for nx in p.next:
+					if not seen.has(nx):
+						seen[nx] = true
+						todo.append(nx)
+			direct[entry] = dests
+	_check(multi_entries == 4, "lane changes: 4 entry lanes have a lane beside them (got %d)" % multi_entries)
+	var unreachable := 0
+	for entry: int in direct:
+		unreachable += g.outside_nodes.size() - 1 - (direct[entry] as Dictionary).size()
+	_check(unreachable > 0, "lane changes: some destinations need a lane change")
+	# Follow every car from its spawn lane to where it leaves the map.
+	var trips := {}  # car id -> [spawn piece, dest node]
+	var needed_change := 0
+	var stats := {}
+	for i in int(240.0 / DT):
+		var present := {}
+		for car in traffic.cars:
+			present[car.id] = true
+			if not trips.has(car.id):
+				trips[car.id] = [car.route[0], car.dest_node]
+			trips[car.id][1] = car.dest_node
+		_run(traffic, DT, stats)
+		var still := {}
+		for car in traffic.cars:
+			still[car.id] = true
+		for id: int in present:
+			if not still.has(id):
+				var t: Array = trips[id]
+				if not (direct[t[0]] as Dictionary).has(t[1]):
+					needed_change += 1
+	_check(traffic.lane_changes > 0, "lane changes: cars change lanes (%d)" % traffic.lane_changes)
+	_check(needed_change >= 10, "lane changes: cars reach destinations their spawn lane doesn't lead to (%d trips)" % needed_change)
+	_check(traffic.completed_trips >= 60, "lane changes: traffic flows (%d trips)" % traffic.completed_trips)
+	_check(traffic.cars.size() < 40, "lane changes: queues stay short (%d cars left)" % traffic.cars.size())
+	_check_limits(stats, "lane changes")
+	net.free()
+	traffic.free()
+
+
+## Cars have different preferred speeds; on a long two-lane one-way road the
+## faster ones pass the slower ones.
+func _test_overtaking() -> void:
+	var setup := _setup(15.0)
+	var net: RoadNetwork = setup[0]
+	var traffic: TrafficManager = setup[1]
+	net.build_road(RoadCurve.straight(Vector3(-HALF, 0, 0), Vector3(HALF, 0, 0)), RoadType.get_type(&"one_way_2"))
+	var stats := _run(traffic, 180.0)
+	_check(traffic.overtakes > 0, "overtaking: faster cars pass slower ones (%d overtakes)" % traffic.overtakes)
+	_check(traffic.completed_trips >= 40, "overtaking: cars complete trips (got %d)" % traffic.completed_trips)
+	_check_limits(stats, "overtaking")
+	net.free()
+	traffic.free()
+
+
+## A crossing whose traffic lights are switched on while cars drive. Nobody
+## enters on red (unless the light changed too late to stop), and cars waiting
+## at red stop at the stop line rather than pulling into the junction.
+func _test_traffic_lights() -> void:
+	var setup := _setup(3.0)
+	var net: RoadNetwork = setup[0]
+	var traffic: TrafficManager = setup[1]
+	net.build_road(RoadCurve.straight(Vector3(-HALF, 0, 0), Vector3(HALF, 0, 0)), _two)
+	net.build_road(RoadCurve.straight(Vector3(0, 0, -HALF), Vector3(0, 0, HALF)), _two)
+	var c := net.find_node_near(Vector3.ZERO, 0.5)
+	var stats := _run(traffic, 30.0)
+	net.set_traffic_lights(c, true)
+	traffic.step(DT)
+	_check(traffic.graph.lights.has(c) and traffic.graph.lights[c].phases == 4, "lights: the crossing has 4 phases")
+	var red_runs := 0
+	var late_goes := 0
+	var entered := 0
+	var stop_min := INF
+	var stop_max := 0.0
+	var last_index := {}
+	var trips := traffic.completed_trips
+	for i in int(240.0 / DT):
+		_run(traffic, DT, stats)
+		for car in traffic.cars:
+			var p := traffic.graph.pieces[car.route[car.index]]
+			if p.is_connection and p.light_node >= 0 and last_index.get(car.id, -1) != car.index:
+				entered += 1
+				if traffic.light_state(p.light_node, p.light_phase) != TrafficManager.Light.GREEN:
+					if car.light_k == car.index and car.light_go:
+						late_goes += 1
+					else:
+						red_runs += 1
+			last_index[car.id] = car.index
+			# First car stopped at a red light: where is it?
+			if not p.is_connection and p.light_node >= 0 and car.v < 0.05 \
+					and traffic.light_state(p.light_node, p.light_phase) == TrafficManager.Light.RED:
+				var first := true
+				for other: TrafficManager.Car in traffic._piece_cars.get(p.id, []):
+					if other.s > car.s:
+						first = false
+				if first:
+					stop_min = minf(stop_min, p.length - car.s)
+					stop_max = maxf(stop_max, p.length - car.s)
+	_check(entered >= 30, "lights: cars drive through (%d)" % entered)
+	_check(red_runs == 0, "lights: nobody enters on red without having to (%d did)" % red_runs)
+	_check(late_goes <= entered / 10, "lights: few cars go through on yellow/red (%d of %d)" % [late_goes, entered])
+	_check(stop_max > 0.0 and stop_min >= 1.3 and stop_max <= 1.7,
+		"lights: cars stop at the stop line (%.1f-%.1f m before the junction)" % [stop_min, stop_max])
+	_check(traffic.completed_trips - trips >= 30, "lights: traffic flows (%d trips)" % (traffic.completed_trips - trips))
+	_check(traffic.cars.size() < 50, "lights: queues stay bounded (%d cars left)" % traffic.cars.size())
+	_check_limits(stats, "lights")
+	# A plain bend can't have lights.
+	net.build_road(RoadCurve.straight(Vector3(50, 0, 50), Vector3(100, 0, 50)), _two)
+	net.build_road(RoadCurve.straight(Vector3(100, 0, 50), Vector3(100, 0, 100)), _two)
+	var b := net.find_node_near(Vector3(100, 0, 50), 0.5)
+	net.set_traffic_lights(b, true)
+	_check(not net.has_traffic_lights(b), "lights: a node with 2 roads has no lights")
 	net.free()
 	traffic.free()
 

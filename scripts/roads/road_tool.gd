@@ -61,7 +61,7 @@ const HINTS := {
 	Mode.UPGRADE: "Left click a road: change it to the selected type (same one-way type: reverse)  ·  Right click: reverse one-way",
 	Mode.LANES: "Click a junction, then an incoming lane (orange), then outgoing lanes (green) to toggle  ·  R: reset junction  ·  Right click: back",
 	Mode.BULLDOZE: "Left click a road to delete it",
-	Mode.NODE: "Click a junction, then drag its handles (Shift: sideways)  ·  A: align corners  ·  Ctrl+C / V: copy / paste  ·  R: reset",
+	Mode.NODE: "Click a junction, then drag its handles (Shift: sideways)  ·  A: align corners  ·  T: traffic lights  ·  Ctrl+C / V: copy / paste  ·  R: reset",
 	Mode.LAYOUT: "Click a lane: reverse it  ·  Right click: remove it  ·  Click beside a road: add a lane  ·  Shift: whole street  ·  Alt: one segment  ·  Ctrl+click: draw with this layout",
 }
 
@@ -192,6 +192,10 @@ func _unhandled_input(event: InputEvent) -> void:
 				reset_node()
 			elif key.keycode == KEY_A:
 				set_aligning(not aligning)
+			elif key.keycode == KEY_T:
+				var node := network.get_node_data(selected_node)
+				if node != null and node.segment_ids.size() >= RoadNetwork.MIN_LIGHT_ROADS:
+					network.set_traffic_lights(selected_node, not node.traffic_lights)
 			elif key.keycode == KEY_C and key.ctrl_pressed:
 				copy_node()
 			elif key.keycode == KEY_V and key.ctrl_pressed:

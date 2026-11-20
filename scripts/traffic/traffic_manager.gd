@@ -7,6 +7,8 @@ extends Node3D
 ## comfortable braking, and a safe time gap to the car ahead. Cars slow down for
 ## curves. At junctions a car must reserve its path before entering: conflicting
 ## paths are first come, first served, and nobody enters if their exit is blocked.
+## On multi-lane roads cars change into the lane their route needs before the
+## junction, and overtake slower cars when another lane leads the same way.
 
 const MAX_SPEED := 70.0 / 3.6
 ## IDM parameters.
@@ -30,6 +32,34 @@ const JUNCTION_APPROACH_SPEED := 9.7
 const JUNCTION_REQUEST_DISTANCE := 35.0
 const SPAWN_SPEED := 12.0
 const SPAWN_CLEARANCE := 20.0
+## Lane changes: seconds for the sideways move. The car keeps its old lane
+## occupied (with a stand-in "ghost" car) until it's done.
+const LANE_CHANGE_TIME := 2.5
+## A lane change may not make the car itself or its new follower brake harder than this (m/s²).
+const LANE_CHANGE_SAFE_DECEL := 3.0
+## Extra room the route leaves before the junction request point for each further lane change (m).
+const LANE_CHANGE_SPACING := 30.0
+## A car that still has to change lanes waits this far before the last point it may start.
+const LANE_CHANGE_STOP_MARGIN := 6.0
+## After waiting this long for a gap, a car drops its lane change and takes another way.
+const LANE_CHANGE_GIVE_UP := 10.0
+## Overtaking (MOBIL): change lanes if it gains this much acceleration (m/s²)...
+const OVERTAKE_GAIN := 0.6
+## ...counting the new follower's loss at this weight.
+const POLITENESS := 0.3
+const OVERTAKE_CHECK_INTERVAL := 0.5
+## Traffic lights: each road in turn gets green, then yellow, then everyone has
+## red for a moment so the junction clears (seconds).
+const LIGHT_GREEN := 15.0
+const LIGHT_YELLOW := 3.0
+const LIGHT_ALL_RED := 2.0
+## At a red light, cars stop with their front this far before the junction (m).
+const RED_STOP_DISTANCE := 1.5
+const STOP_LINE_WIDTH := 0.4
+const STOP_LINE_COLOR := Color(0.95, 0.95, 0.95, 0.9)
+const LIGHT_COLORS: Array[Color] = [Color(0.1, 1.0, 0.25), Color(1.0, 0.75, 0.05), Color(1.0, 0.1, 0.05)]
+
+enum Light { GREEN, YELLOW, RED }
 const CAR_COLORS: Array[Color] = [
 	Color(0.85, 0.2, 0.2), Color(0.2, 0.45, 0.85), Color(0.9, 0.9, 0.9), Color(0.15, 0.15, 0.15),
 	Color(0.95, 0.75, 0.2), Color(0.3, 0.65, 0.35), Color(0.6, 0.6, 0.65), Color(0.55, 0.3, 0.7),
@@ -46,6 +76,8 @@ class Car:
 	var s: float = 0.0
 	var v: float = 0.0
 	var accel: float = 0.0
+	## Speed the driver likes to go (up to MAX_SPEED); faster drivers overtake slower ones.
+	var max_speed: float = MAX_SPEED
 	var dest_node: int = -1
 	var color: Color
 	## Junction path (route index) whose conflict zones the car is queued for, and since when.
@@ -59,8 +91,26 @@ class Car:
 	var committed: Dictionary = {}
 	var front_pos := Vector3.ZERO
 	var heading := Vector3.FORWARD
-	## What limited the car most this step: "free", "curve", "leader", "junction" (for debugging).
+	## What limited the car most this step: "free", "curve", "leader", "junction", "lane" (for debugging).
 	var limit := "free"
+	## Lane change in progress: a stand-in car keeping the old lane piece occupied,
+	## its offset along that piece (s there = s here + ghost_ds), and the lane piece changed into.
+	var ghost: Car = null
+	var ghost_piece: int = -1
+	var ghost_ds: float = 0.0
+	var change_piece: int = -1
+	## Sideways offset (m, + = right) from the new lane when the change started, and time since then.
+	var change_lat: float = 0.0
+	var change_time: float = INF
+	## How long the car has been stopped waiting to change lanes.
+	var change_wait: float = 0.0
+	var next_overtake_check: float = 0.0
+	## Traffic light decision for the junction path at route index `light_k`
+	## (made when the light turned yellow or red): go through, or stop at the line.
+	var light_k: int = -1
+	var light_go: bool = false
+	## Set while the car's next junction stop is a red light.
+	var at_red: bool = false
 
 
 @export var network: RoadNetwork
@@ -71,6 +121,11 @@ class Car:
 var graph: TrafficGraph
 var cars: Array[Car] = []
 var completed_trips: int = 0
+## Lane changes done so far, and how many of them were overtakes.
+var lane_changes: int = 0
+var overtakes: int = 0
+## Lane changes dropped because no gap came up (the car took another way).
+var lane_change_give_ups: int = 0
 var rng := RandomNumberGenerator.new()
 
 var _time := 0.0
@@ -85,6 +140,10 @@ var _entering: Dictionary = {}  # connection piece id -> Array of Car committed 
 var _piece_cars: Dictionary = {}  # piece id -> Array of Car, sorted by s
 var _multimesh: MultiMesh
 var _markers: MeshInstance3D
+var _light_parts: MultiMesh
+var _lamps: MultiMesh
+## Per lamp instance: [node id, phase, Light it shows].
+var _lamp_info: Array[Array] = []
 
 
 func _init() -> void:
@@ -110,6 +169,36 @@ func _ready() -> void:
 	_markers.mesh = ImmediateMesh.new()
 	_markers.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	add_child(_markers)
+	# Traffic lights: poles and housings (unit boxes scaled per instance), and lamps.
+	_light_parts = MultiMesh.new()
+	_light_parts.transform_format = MultiMesh.TRANSFORM_3D
+	_light_parts.use_colors = true
+	var part := BoxMesh.new()
+	part.size = Vector3.ONE
+	part.material = mat
+	_light_parts.mesh = part
+	var parts_mmi := MultiMeshInstance3D.new()
+	parts_mmi.multimesh = _light_parts
+	add_child(parts_mmi)
+	_lamps = MultiMesh.new()
+	_lamps.transform_format = MultiMesh.TRANSFORM_3D
+	_lamps.use_colors = true
+	var lamp := SphereMesh.new()
+	lamp.radius = 0.13
+	lamp.height = 0.26
+	lamp.radial_segments = 12
+	lamp.rings = 6
+	var lamp_mat := StandardMaterial3D.new()
+	lamp_mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	lamp_mat.vertex_color_use_as_albedo = true
+	lamp.material = lamp_mat
+	_lamps.mesh = lamp
+	var lamps_mmi := MultiMeshInstance3D.new()
+	lamps_mmi.multimesh = _lamps
+	lamps_mmi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	add_child(lamps_mmi)
+	if graph != null:  # simulated before entering the tree
+		_draw_markers()
 
 
 func _physics_process(delta: float) -> void:
@@ -147,6 +236,8 @@ func step(delta: float) -> void:
 	for car in arrived:
 		completed_trips += 1
 		_remove_car(car)
+	for car in cars:
+		_update_lane_change(car, delta)
 
 
 func _on_network_changed() -> void:
@@ -200,6 +291,10 @@ func _relocate(car: Car) -> bool:
 	car.pending.clear()
 	car.committed.clear()
 	car.request_k = -1
+	car.ghost = null
+	car.change_time = INF
+	car.change_wait = 0.0
+	car.light_k = -1
 	var piece := graph.pieces[best_piece]
 	if piece.is_connection:
 		# Already inside the junction: it takes the zones it still has to pass.
@@ -233,7 +328,8 @@ func _spawn() -> void:
 			car.route = route
 			car.dest_node = graph.pieces[route[route.size() - 1]].node_id
 			car.s = minf(CAR_LENGTH, graph.pieces[entry].length)
-			car.v = _safe_spawn_speed(entry, car.s)
+			car.max_speed = MAX_SPEED * rng.randf_range(0.8, 1.0)
+			car.v = minf(_safe_spawn_speed(entry, car.s), car.max_speed)
 			car.color = CAR_COLORS[rng.randi() % CAR_COLORS.size()]
 			car.front_pos = graph.pieces[entry].position_at(car.s)
 			car.heading = graph.pieces[entry].direction_at(car.s)
@@ -285,7 +381,7 @@ func _random_route(entry: int, from_node: int) -> PackedInt32Array:
 ## car ahead and by a stop line at a junction the car may not enter yet.
 func _acceleration(car: Car) -> float:
 	var v := car.v
-	var v0 := MAX_SPEED
+	var v0 := car.max_speed
 	var approach := INF
 	var need := 0.0  # braking needed to slow for curves ahead
 	var approach_need := 0.0  # braking needed to slow for the junction ahead
@@ -301,6 +397,8 @@ func _acceleration(car: Car) -> float:
 	## While the junction is still far off, its stop line isn't a real stop yet,
 	## so cars waiting inside it count (otherwise they'd appear suddenly).
 	var horizon := INF
+	## Where the car has to come to rest for a red light (distance from its front).
+	var red_stop := INF
 	var k := car.index
 	while k < car.route.size() and to_piece < LOOKAHEAD:
 		var p := graph.pieces[car.route[k]]
@@ -316,16 +414,20 @@ func _acceleration(car: Car) -> float:
 					need = maxf(need, (v * v - vl * vl) / (2.0 * maxf(d, 0.5)))
 		# Junction (the one we're in, then the next): drive up to the first
 		# conflict zone we can't reserve yet and wait there.
-		if p.is_connection and not p.zones.is_empty() and stop == INF and not junction_checked:
+		# At a red light the car stops at the stop line instead.
+		if p.is_connection and (not p.zones.is_empty() or p.light_node >= 0) and stop == INF and not junction_checked:
 			junction_checked = k > car.index
+			car.at_red = false
 			stop = _junction_stop(car, p, k, to_piece)
-			if k == car.index or to_piece - STOP_LINE_MARGIN < JUNCTION_REQUEST_DISTANCE:
+			if k == car.index or to_piece - STOP_LINE_MARGIN < JUNCTION_REQUEST_DISTANCE or car.at_red:
 				horizon = stop
 			if stop < INF:
-				var va := JUNCTION_APPROACH_SPEED
+				var va := 0.0 if car.at_red else JUNCTION_APPROACH_SPEED
 				approach = minf(approach, sqrt(va * va + 2.0 * COMFORT_DECEL * stop))
 				approach_need = (v * v - va * va) / (2.0 * maxf(stop, 0.5))
-				if stop < JUNCTION_REQUEST_DISTANCE:
+				if car.at_red:
+					red_stop = stop
+				elif stop < JUNCTION_REQUEST_DISTANCE:
 					# A stop point needs no time gap, just room to stop.
 					var term := _idm_interaction(v, stop, v, 0.0)
 					if term < accel:
@@ -363,11 +465,30 @@ func _acceleration(car: Car) -> float:
 						leader_found = true
 			if to_piece + p.length > horizon:
 				leader_found = true
+		# A lane change ahead: the car can't go on along this lane, so it waits at
+		# the last point to start the change if it hasn't found a gap by then.
+		if k + 1 < car.route.size() and graph.is_lane_change(p.id, car.route[k + 1]):
+			var stop_s := clampf(_change_deadline(car.route, k) - LANE_CHANGE_STOP_MARGIN, CAR_LENGTH + 2.0, p.length - 1.0)
+			if k == car.index and car.s > stop_s:
+				stop_s = p.length - 1.0
+			var term := _idm_interaction(v, to_piece + stop_s, v, 0.0)
+			if term < accel:
+				accel = term
+				car.limit = "lane"
+			break
 		to_piece += p.length
 		k += 1
+	# Mid lane change the car is still partly in its old lane.
+	if car.ghost != null:
+		var lead := _lane_leader(graph.pieces[car.ghost_piece], car.ghost.s, car)
+		if not lead.is_empty():
+			var term := _idm_interaction(v, lead.gap, v - lead.v, TIME_HEADWAY)
+			if term < accel:
+				accel = term
+				car.limit = "leader"
 	if accel == INF:
 		accel = 0.0
-		car.limit = "curve" if v0 < MAX_SPEED - 0.1 else "free"
+		car.limit = "curve" if v0 < car.max_speed - 0.1 else "free"
 	if approach < v0:
 		v0 = approach
 		if car.limit != "leader":
@@ -382,7 +503,23 @@ func _acceleration(car: Car) -> float:
 		result = -brake
 		if car.limit == "free":
 			car.limit = "junction" if approach_need >= need else "curve"
+	if red_stop < INF:
+		var stop_accel := _stop_accel(v, red_stop)
+		if stop_accel < result:
+			result = stop_accel
+			car.limit = "light"
 	return clampf(result, -MAX_DECEL, MAX_ACCEL)
+
+
+## Acceleration that brings the car to rest exactly `d` m ahead: brake evenly
+## (v² / 2d) once it's faster than a gentle approach allows, otherwise roll up.
+func _stop_accel(v: float, d: float) -> float:
+	if d <= 0.05:
+		return -minf(v * 10.0, MAX_DECEL)
+	var gentle := sqrt(COMFORT_DECEL * d)  # speed from which braking at half comfort stops in d
+	if v > gentle:
+		return -v * v / (2.0 * d)
+	return minf((gentle - v) * 3.0, MAX_ACCEL)
 
 
 ## IDM braking term for an obstacle `gap` meters ahead approached at `dv` m/s,
@@ -402,6 +539,9 @@ func _idm_interaction(v: float, gap: float, dv: float, headway: float) -> float:
 ## a circle.
 func _junction_stop(car: Car, p: TrafficGraph.Piece, k: int, to_piece: float) -> float:
 	var on_piece := k == car.index
+	if not on_piece and p.light_node >= 0 and _must_stop_at_light(car, p, k, to_piece):
+		car.at_red = true
+		return maxf(to_piece - RED_STOP_DISTANCE, 0.0)
 	if not on_piece:
 		var to_line := maxf(to_piece - STOP_LINE_MARGIN, 0.0)
 		if to_line >= JUNCTION_REQUEST_DISTANCE:
@@ -425,6 +565,54 @@ func _junction_stop(car: Car, p: TrafficGraph.Piece, k: int, to_piece: float) ->
 			return maxf(to_piece + z.start - STOP_LINE_MARGIN, 0.0)
 		_take(car, z, k)
 	return INF
+
+
+## Traffic lights: on green the car drives on. Once the light turns yellow (or
+## red) it decides once whether it can stop comfortably at the line; if so it
+## stops there (and gives up any junction reservations) until green, otherwise
+## it goes through.
+func _must_stop_at_light(car: Car, p: TrafficGraph.Piece, k: int, to_piece: float) -> bool:
+	var state := light_state(p.light_node, p.light_phase)
+	if state == Light.GREEN:
+		if car.light_k == k:
+			car.light_k = -1
+		return false
+	if car.light_k != k:
+		car.light_k = k
+		var room := maxf(to_piece - RED_STOP_DISTANCE, 0.1)
+		car.light_go = car.v * car.v / (2.0 * room) > COMFORT_DECEL
+	if car.light_go:
+		return false
+	_withdraw(car, k)
+	return true
+
+
+## Drops the car's queue place, reservations and commitment for junction path `k`.
+func _withdraw(car: Car, k: int) -> void:
+	if car.request_k == k:
+		_cancel_request(car)
+	for i in range(car.held.size() - 1, -1, -1):
+		var h := car.held[i]
+		if h.k == k:
+			(_zone_holders[h.zone][h.side] as Array).erase(car)
+			car.held.remove_at(i)
+	if car.committed.has(k):
+		_entering_list(car.committed[k]).erase(car)
+		car.committed.erase(k)
+
+
+## Light shown to traffic of `phase` at junction `node_id`.
+func light_state(node_id: int, phase: int) -> Light:
+	var info: Dictionary = graph.lights.get(node_id, {})
+	if info.is_empty():
+		return Light.GREEN
+	var step := LIGHT_GREEN + LIGHT_YELLOW + LIGHT_ALL_RED
+	var t := fmod(_time, step * info.phases)
+	var current := int(t / step)
+	var within := t - current * step
+	if current != phase or within >= LIGHT_GREEN + LIGHT_YELLOW:
+		return Light.RED
+	return Light.GREEN if within < LIGHT_GREEN else Light.YELLOW
 
 
 func _exit_has_room(p: TrafficGraph.Piece) -> bool:
@@ -499,6 +687,9 @@ func _advance(car: Car, ds: float) -> bool:
 	while car.s >= piece.length:
 		if car.index + 1 >= car.route.size():
 			return false
+		if graph.is_lane_change(piece.id, car.route[car.index + 1]):
+			car.s = piece.length - 0.01  # has to change lanes first
+			break
 		car.s -= piece.length
 		_piece_list(piece.id).erase(car)
 		car.index += 1
@@ -526,6 +717,249 @@ func _advance(car: Car, ds: float) -> bool:
 	return true
 
 
+# ---------------------------------------------------------------- lane changes
+
+## Starts a lane change the route needs, or an overtake; animates one in progress.
+func _update_lane_change(car: Car, delta: float) -> void:
+	if car.change_time < LANE_CHANGE_TIME:
+		car.change_time += delta
+	if car.ghost != null:
+		if car.change_time >= LANE_CHANGE_TIME or car.route[car.index] != car.change_piece:
+			_end_ghost(car)
+		else:
+			var old := graph.pieces[car.ghost_piece]
+			car.ghost.s = clampf(car.s + car.ghost_ds, 0.0, old.length)
+			car.ghost.v = car.v
+		return
+	var i := car.index
+	if i + 1 < car.route.size() and graph.is_lane_change(car.route[i], car.route[i + 1]):
+		if _try_change(car, car.route[i + 1], false):
+			car.change_wait = 0.0
+		elif car.v < 0.5:
+			car.change_wait += delta
+			if car.change_wait > LANE_CHANGE_GIVE_UP:
+				_give_up_change(car)
+		return
+	if _time >= car.next_overtake_check:
+		car.next_overtake_check = _time + OVERTAKE_CHECK_INTERVAL
+		_try_overtake(car)
+
+
+## Distance along route piece `k` by which the lane change(s) starting there
+## should be done: before the next junction's request point, leaving room for
+## each further change. On a short lane: anywhere before its end.
+func _change_deadline(route: PackedInt32Array, k: int) -> float:
+	var n := 1
+	while k + n < route.size() - 1 and graph.is_lane_change(route[k + n], route[k + n + 1]):
+		n += 1
+	var length := graph.pieces[route[k]].length
+	var d := length - JUNCTION_REQUEST_DISTANCE - LANE_CHANGE_SPACING * (n - 1)
+	if d < CAR_LENGTH + 20.0:
+		d = length - 2.0 - 10.0 * (n - 1)
+	return d
+
+
+## Moves the car into lane piece `to` beside its own if there is a safe gap and
+## it can still finish before the deadline. With `overtake`, `new_route` replaces
+## the rest of the route.
+func _try_change(car: Car, to: int, overtake: bool, new_route := PackedInt32Array()) -> bool:
+	var a := graph.pieces[car.route[car.index]]
+	var b := graph.pieces[to]
+	if car.s < CAR_LENGTH + 1.0:
+		return false  # tail still in the junction behind
+	if car.v >= 1.0 and car.s + (car.v + 1.0) * LANE_CHANGE_TIME > _change_deadline(car.route, car.index):
+		return false
+	var s_b := b.project(a.position_at(car.s)).x
+	if s_b < CAR_LENGTH + 1.0 or s_b > b.length - 1.0:
+		return false
+	if not _change_safe(car, b, s_b):
+		return false
+	# Junction state for pieces after this one refers to route indices that change.
+	_cancel_request(car)
+	for j in range(car.held.size() - 1, -1, -1):
+		var h := car.held[j]
+		if h.k >= car.index:
+			(_zone_holders[h.zone][h.side] as Array).erase(car)
+			car.held.remove_at(j)
+	for k: int in car.committed.keys():
+		if k >= car.index:
+			_entering_list(car.committed[k]).erase(car)
+			car.committed.erase(k)
+	if overtake:
+		var r := car.route.slice(0, car.index)
+		r.append_array(new_route)
+		car.route = r
+		overtakes += 1
+	else:
+		var r := car.route.duplicate()  # routes are shared with the route cache
+		r.remove_at(car.index)
+		car.route = r
+	lane_changes += 1
+	# The car moves to the new lane now; a ghost holds its place in the old one.
+	var ghost := Car.new()
+	ghost.id = -car.id
+	ghost.s = car.s
+	ghost.v = car.v
+	_piece_list(a.id).erase(car)
+	_insert_sorted(_piece_list(a.id), ghost)
+	car.ghost = ghost
+	car.ghost_piece = a.id
+	car.ghost_ds = car.s - s_b
+	car.change_piece = b.id
+	var old_pos := a.position_at(car.s)
+	car.s = s_b
+	_insert_sorted(_piece_list(b.id), car)
+	car.front_pos = b.position_at(s_b)
+	car.heading = b.direction_at(s_b)
+	car.change_lat = (old_pos - car.front_pos).dot(_right(car.heading))
+	car.change_time = 0.0
+	return true
+
+
+## A lane change is safe if neither the car nor its new follower would have to
+## brake harder than LANE_CHANGE_SAFE_DECEL.
+func _change_safe(car: Car, b: TrafficGraph.Piece, s_b: float) -> bool:
+	var lead := _lane_leader(b, s_b, car)
+	if not lead.is_empty():
+		if lead.gap < MIN_GAP + 0.5 or _idm_interaction(car.v, lead.gap, car.v - lead.v, TIME_HEADWAY) < -LANE_CHANGE_SAFE_DECEL:
+			return false
+	var follow := _lane_follower(b, s_b, car)
+	if not follow.is_empty():
+		if follow.gap < MIN_GAP + 0.5 or _idm_interaction(follow.v, follow.gap, follow.v - car.v, TIME_HEADWAY) < -LANE_CHANGE_SAFE_DECEL:
+			return false
+	return true
+
+
+## MOBIL: move to a lane beside if that lets the car go noticeably faster, net
+## of what it costs the new follower, and the lane leads the same way.
+func _try_overtake(car: Car) -> void:
+	var a := graph.pieces[car.route[car.index]]
+	if car.limit != "leader" or a.is_connection or a.beside.is_empty() or car.s < CAR_LENGTH + 1.0:
+		return
+	# Far enough from the junction to settle in (and its route won't need changes back).
+	if car.s + (car.v + 1.0) * LANE_CHANGE_TIME > a.length - JUNCTION_REQUEST_DISTANCE - LANE_CHANGE_SPACING:
+		return
+	var current := _lane_leader(a, car.s, car)
+	if current.is_empty():
+		return
+	var gain_now := _free_accel(car.v, car.max_speed) + _idm_interaction(car.v, current.gap, car.v - current.v, TIME_HEADWAY)
+	var next_road := -1
+	if car.index + 1 < car.route.size():
+		next_road = RoadNetwork.key_segment(graph.pieces[car.route[car.index + 1]].out_key)
+	for c_id in a.beside:
+		var c := graph.pieces[c_id]
+		var s_c := c.project(a.position_at(car.s)).x
+		var lead := _lane_leader(c, s_c, car)
+		var gain := _free_accel(car.v, car.max_speed)
+		if not lead.is_empty():
+			gain += _idm_interaction(car.v, lead.gap, car.v - lead.v, TIME_HEADWAY)
+		var follow := _lane_follower(c, s_c, car)
+		if not follow.is_empty():
+			gain += POLITENESS * _idm_interaction(follow.v, follow.gap, follow.v - car.v, TIME_HEADWAY)
+		if gain - gain_now < OVERTAKE_GAIN:
+			continue
+		# The other lane must take the car onto the same road without changing back.
+		var r := graph.route(c_id, car.dest_node)
+		if r.is_empty():
+			continue
+		if next_road < 0:
+			if r.size() != 1:
+				continue
+		elif r.size() < 2 or graph.is_lane_change(r[0], r[1]) or RoadNetwork.key_segment(graph.pieces[r[1]].out_key) != next_road:
+			continue
+		if _try_change(car, c_id, true, r):
+			return
+
+
+## The car couldn't get into the lane it needs: it takes another way from its
+## current lane (to its destination if possible, else to any outside connection).
+func _give_up_change(car: Car) -> void:
+	car.change_wait = 0.0
+	lane_change_give_ups += 1
+	var a := graph.pieces[car.route[car.index]]
+	var dests: Array[int] = [car.dest_node]
+	for n in graph.outside_nodes:
+		if n != car.dest_node and n != a.from_node:
+			dests.append(n)
+	for dest in dests:
+		for nx in a.next:
+			var r := graph.route(nx, dest)
+			if r.is_empty():
+				continue
+			_cancel_request(car)
+			var head := car.route.slice(0, car.index + 1)
+			head.append_array(r)
+			car.route = head
+			car.dest_node = dest
+			return
+
+
+func _end_ghost(car: Car) -> void:
+	if car.ghost == null:
+		return
+	_piece_list(car.ghost_piece).erase(car.ghost)
+	car.ghost = null
+
+
+## The car (or ghost) right ahead of distance `s` on lane piece `p`, or the tail
+## of one that just left it: {gap, v}. Empty if none.
+func _lane_leader(p: TrafficGraph.Piece, s: float, me: Car) -> Dictionary:
+	var best: Car = null
+	for other: Car in _piece_cars.get(p.id, []):
+		if other == me or other == me.ghost or other.s <= s:
+			continue
+		if best == null or other.s < best.s:
+			best = other
+	if best != null:
+		return {"gap": best.s - CAR_LENGTH - s, "v": best.v}
+	var result := {}
+	for nid in p.next:
+		for other: Car in _piece_cars.get(nid, []):
+			if other != me and other.s < CAR_LENGTH:
+				var gap := p.length - s + other.s - CAR_LENGTH
+				if result.is_empty() or gap < result.gap:
+					result = {"gap": gap, "v": other.v}
+	return result
+
+
+## The car (or ghost) right behind distance `s` on lane piece `p`, or the
+## nearest one about to enter it: {gap, v}. Empty if none.
+func _lane_follower(p: TrafficGraph.Piece, s: float, me: Car) -> Dictionary:
+	var best: Car = null
+	for other: Car in _piece_cars.get(p.id, []):
+		if other == me or other == me.ghost or other.s > s:
+			continue
+		if best == null or other.s > best.s:
+			best = other
+	if best != null:
+		return {"gap": s - CAR_LENGTH - best.s, "v": best.v}
+	var result := {}
+	for pid in p.prev:
+		var prev := graph.pieces[pid]
+		for other: Car in _piece_cars.get(pid, []):
+			if other == me:
+				continue
+			var gap := s - CAR_LENGTH + prev.length - other.s
+			if result.is_empty() or gap < result.gap:
+				result = {"gap": gap, "v": other.v}
+	return result
+
+
+func _free_accel(v: float, v0: float) -> float:
+	return MAX_ACCEL * (1.0 - pow(v / v0, ACCEL_EXPONENT))
+
+
+func _insert_sorted(list: Array, car: Car) -> void:
+	var i := 0
+	while i < list.size() and (list[i] as Car).s < car.s:
+		i += 1
+	list.insert(i, car)
+
+
+static func _right(dir: Vector3) -> Vector3:
+	return Vector3(-dir.z, 0.0, dir.x).normalized()
+
+
 func _remove_car(car: Car) -> void:
 	_cancel_request(car)
 	for h in car.held:
@@ -534,6 +968,7 @@ func _remove_car(car: Car) -> void:
 	for k: int in car.committed:
 		_entering_list(car.committed[k]).erase(car)
 	car.committed.clear()
+	_end_ghost(car)
 	_piece_list(car.route[car.index]).erase(car)
 	cars.erase(car)
 
@@ -573,6 +1008,15 @@ func car_pose(car: Car) -> Transform3D:
 	dir.y = 0.0
 	if dir.length_squared() < 1e-6:
 		dir = car.heading
+	if car.change_time < LANE_CHANGE_TIME:
+		# Sliding over from the old lane; the rear follows a little later, so
+		# the car turns slightly into the new lane.
+		var t := car.change_time / LANE_CHANGE_TIME
+		var side := _right(dir) * car.change_lat
+		front += side * (1.0 - smoothstep(0.0, 0.85, t))
+		rear += side * (1.0 - smoothstep(0.15, 1.0, t))
+		dir = front - rear
+		dir.y = 0.0
 	var center := (front + rear) * 0.5
 	center.y = RoadNetwork.ROAD_Y + CAR_HEIGHT * 0.5
 	return Transform3D(Basis.looking_at(dir.normalized(), Vector3.UP), center)
@@ -587,6 +1031,12 @@ func _update_visuals() -> void:
 	for i in cars.size():
 		_multimesh.set_instance_transform(i, car_pose(cars[i]))
 		_multimesh.set_instance_color(i, cars[i].color)
+	for i in _lamp_info.size():
+		var info := _lamp_info[i]
+		var shows: Light = info[2]
+		var lit := light_state(info[0], info[1]) == shows
+		var color := LIGHT_COLORS[shows]
+		_lamps.set_instance_color(i, color if lit else color.darkened(0.85))
 
 
 func _draw_markers() -> void:
@@ -602,3 +1052,50 @@ func _draw_markers() -> void:
 		batch.arrow(pos + out * 2.0, out, 1.6, MARKER_COLOR)
 		batch.arrow(pos - out * 2.0, -out, 1.6, MARKER_COLOR)
 	batch.commit(im, TriBatch.make_material(true))
+	# Stop lines where cars wait at red lights.
+	var lines := TriBatch.new()
+	for p in graph.pieces:
+		if p.is_connection or p.light_node < 0 or not graph.lights.has(p.light_node):
+			continue
+		var dir := p.direction_at(p.length)
+		var across := dir.cross(Vector3.UP) * RoadType.LANE_WIDTH * 0.47
+		var mid := p.position_at(p.length) - dir * (RED_STOP_DISTANCE - STOP_LINE_WIDTH * 0.5 - 0.1)
+		mid.y = RoadNetwork.ROAD_Y + 0.02
+		var half := dir * STOP_LINE_WIDTH * 0.5
+		lines.tri(mid - across - half, mid + across - half, mid + across + half, STOP_LINE_COLOR)
+		lines.tri(mid - across - half, mid + across + half, mid - across + half, STOP_LINE_COLOR)
+	lines.commit(im, TriBatch.make_material(false))
+	_build_lights()
+
+
+## Poles, housings and lamps for every road with a traffic light, at the curb
+## on the right of the incoming traffic, facing it.
+func _build_lights() -> void:
+	if _lamps == null:
+		return
+	_lamp_info.clear()
+	var parts: Array[Transform3D] = []
+	var lamps: Array[Transform3D] = []
+	for node_id: int in graph.lights:
+		var ends: Array = graph.lights[node_id].ends
+		for phase in ends.size():
+			var e: Dictionary = ends[phase]
+			var out: Vector3 = e.out
+			var side: Vector3 = e.side  # right of `out`
+			var base: Vector3 = e.left + out * 1.2 - side * 0.9
+			base.y = 0.0
+			var facing := Basis.looking_at(out, Vector3.UP)  # front (-Z) toward approaching cars
+			parts.append(Transform3D(facing.scaled(Vector3(0.16, 4.2, 0.16)), base + Vector3.UP * 2.1))
+			var head := base + Vector3.UP * 3.7
+			parts.append(Transform3D(facing.scaled(Vector3(0.45, 1.25, 0.32)), head))
+			for light: Light in [Light.RED, Light.YELLOW, Light.GREEN]:
+				var y := 0.38 * (light - 1)  # red on top, green at the bottom
+				lamps.append(Transform3D(Basis(), head + out * 0.15 + Vector3.UP * y))
+				_lamp_info.append([node_id, phase, light])
+	_light_parts.instance_count = parts.size()
+	for i in parts.size():
+		_light_parts.set_instance_transform(i, parts[i])
+		_light_parts.set_instance_color(i, Color(0.18, 0.19, 0.2))
+	_lamps.instance_count = lamps.size()
+	for i in lamps.size():
+		_lamps.set_instance_transform(i, lamps[i])

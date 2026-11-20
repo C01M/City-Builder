@@ -12,6 +12,7 @@ var _node_id := -1
 var _segments: Array[int] = []
 var _title: Label
 var _mode: OptionButton
+var _lights: CheckBox
 var _align: Button
 var _paste: Button
 var _ends_box: VBoxContainer
@@ -57,6 +58,12 @@ func setup(road_tool: RoadTool, road_network: RoadNetwork) -> void:
 		network.set_node_mode(_node_id, index as RoadNetwork.NodeMode))
 	mode_row.add_child(_mode)
 
+	_lights = CheckBox.new()
+	_lights.text = "Traffic lights (T)"
+	_lights.focus_mode = Control.FOCUS_NONE
+	_lights.toggled.connect(func(on: bool) -> void: network.set_traffic_lights(_node_id, on))
+	column.add_child(_lights)
+
 	var buttons := HBoxContainer.new()
 	column.add_child(buttons)
 	_align = _add_button(buttons, "Align", func() -> void: tool.set_aligning(not tool.aligning))
@@ -98,6 +105,9 @@ func _refresh() -> void:
 	_mode.select(node.mode)
 	for i in [RoadNetwork.NodeMode.MIDDLE, RoadNetwork.NodeMode.STRETCH]:
 		_mode.set_item_disabled(i, segs.size() != 2)
+	_lights.set_pressed_no_signal(node.traffic_lights)
+	_lights.disabled = segs.size() < RoadNetwork.MIN_LIGHT_ROADS
+	_lights.tooltip_text = "Each road in turn gets green" if not _lights.disabled else "Needs a junction of 3 or more roads"
 	_align.set_pressed_no_signal(tool.aligning)
 	_paste.disabled = not tool.has_clipboard()
 	for info in infos:

@@ -17,13 +17,17 @@ func _initialize() -> void:
 	net.build_road(RoadCurve.straight(Vector3(40, 0, -edge), Vector3(40, 0, 0)), one, {}, {"on_segment": true})
 	traffic.spawn_rate = 8.0
 	traffic.rng.seed = 7
+	# `-- lights`: traffic lights at the center crossing, seen up close.
+	var lights := OS.get_cmdline_user_args().has("lights")
+	if lights:
+		net.set_traffic_lights(net.find_node_near(Vector3.ZERO, 0.5), true)
 	for i in 150 * 30:  # 150 s of traffic, so cars have reached the center
 		traffic.step(1.0 / 30.0)
 	# Fixed view for screenshots, applied once the rig is ready; ignore mouse input.
 	var rig: Node3D = main.get_node("CameraRig")
 	process_frame.connect(func() -> void:
 		rig.set_process_unhandled_input(false)
-		rig.position = Vector3(15, 0, 5)
-		rig.set("_distance", 75.0)
-		rig.set("_pitch", deg_to_rad(-55.0))
+		rig.position = Vector3(0, 0, 0) if lights else Vector3(15, 0, 5)
+		rig.set("_distance", 40.0 if lights else 75.0)
+		rig.set("_pitch", deg_to_rad(-40.0 if lights else -55.0))
 		rig.call("_update_camera"), CONNECT_ONE_SHOT)

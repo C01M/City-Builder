@@ -11,6 +11,9 @@ const LATERAL_ACCEL := 7.0
 const ZONE_DISTANCE := 2.8
 ## Road ends this close to the map edge count as outside connections.
 const BORDER_TOLERANCE := 3.0
+## Routing cost of a lane change, in meters of driving. Keeps routes from
+## weaving across lanes when staying put is about as short.
+const LANE_CHANGE_COST := 40.0
 
 
 class Piece:
@@ -30,6 +33,15 @@ class Piece:
 	var speed_limit := PackedFloat32Array()
 	var length: float = 0.0
 	var next: Array[int] = []
+	## Traffic lights: the light-controlled node this lane flows into (or this
+	## connection crosses) and which phase of its cycle is green for it; -1 if none.
+	var light_node: int = -1
+	var light_phase: int = -1
+	## Pieces whose `next` includes this one.
+	var prev: Array[int] = []
+	## Lanes: the lane pieces right beside this one on the same segment going the
+	## same way, which a car can change into (lane-change edges for routing).
+	var beside: Array[int] = []
 	## Connection pieces at the same junction that share a conflict zone with this one.
 	var conflicts: Array[int] = []
 	## Conflict zones along this connection, sorted by start:
@@ -139,6 +151,10 @@ var lane_pieces: Dictionary = {}  # lane key -> piece id
 var outside_nodes: Array[int] = []
 var entry_pieces: Dictionary = {}  # outside node id -> Array of lane piece ids leaving it
 var exit_pieces: Dictionary = {}  # outside node id -> Array of lane piece ids arriving at it
+## Junctions with traffic lights: node id -> {phases: number of phases (one per
+## road bringing traffic in, in order around the node), ends: node_end_info of
+## those roads in phase order}.
+var lights: Dictionary = {}
 var _route_cache: Dictionary = {}
 
 
@@ -160,6 +176,18 @@ static func build(network: RoadNetwork, map_half_size: float, max_speed: float) 
 			p.from_node = seg.start_id if forward else seg.end_id
 			p.node_id = seg.end_id if forward else seg.start_id
 			g.lane_pieces[p.lane_key] = p.id
+		# Neighboring lanes in the same direction are lane-change edges.
+		for i in range(1, seg.type.lanes.size()):
+			var a_key := RoadNetwork.lane_key(seg.id, i - 1)
+			var b_key := RoadNetwork.lane_key(seg.id, i)
+			if seg.type.lanes[i - 1].forward != seg.type.lanes[i].forward:
+				continue
+			if not g.lane_pieces.has(a_key) or not g.lane_pieces.has(b_key):
+				continue
+			var a := g.pieces[g.lane_pieces[a_key]]
+			var b := g.pieces[g.lane_pieces[b_key]]
+			a.beside.append(b.id)
+			b.beside.append(a.id)
 
 	# Connections through nodes. Cars leave the map at outside connections, so
 	# nobody turns around there (it would cut into the cars entering).
@@ -203,11 +231,47 @@ static func build(network: RoadNetwork, map_half_size: float, max_speed: float) 
 			(g.entry_pieces[p.from_node] as Array).append(p.id)
 		if g.exit_pieces.has(p.node_id):
 			(g.exit_pieces[p.node_id] as Array).append(p.id)
+	for p in g.pieces:
+		for nx in p.next:
+			g.pieces[nx].prev.append(p.id)
+
+	# Traffic lights: each road bringing traffic in gets its own green phase.
+	for node_id: int in network.nodes:
+		if not network.has_traffic_lights(node_id):
+			continue
+		var ends: Array[Dictionary] = []
+		for info in network.node_end_info(node_id):
+			var phase := ends.size()
+			var any := false
+			for p in g.pieces:
+				if not p.is_connection and p.node_id == node_id and RoadNetwork.key_segment(p.lane_key) == info.segment_id:
+					p.light_node = node_id
+					p.light_phase = phase
+					any = true
+			if any:
+				ends.append(info)
+		if ends.size() < 2:  # traffic comes in from one road only: nothing to switch
+			for p in g.pieces:
+				if p.light_node == node_id:
+					p.light_node = -1
+			continue
+		g.lights[node_id] = {"phases": ends.size(), "ends": ends}
+		for p in g.pieces:
+			if p.is_connection and p.node_id == node_id:
+				var lane := g.pieces[g.lane_pieces[p.in_key]]
+				p.light_node = lane.light_node
+				p.light_phase = lane.light_phase
 	return g
 
 
+## True if going from piece `a` to piece `b` is a lane change (not driving on).
+func is_lane_change(a: int, b: int) -> bool:
+	return pieces[a].beside.has(b)
+
+
 ## Shortest route (piece ids, starting with `start`) to a lane arriving at
-## `dest_node`. Empty if there is none.
+## `dest_node`. Empty if there is none. Consecutive lane pieces of the same
+## segment (`is_lane_change`) mean the car changes lanes along that segment.
 func route(start: int, dest_node: int) -> PackedInt32Array:
 	var key := Vector2i(start, dest_node)
 	if _route_cache.has(key):
@@ -240,6 +304,13 @@ func route(start: int, dest_node: int) -> PackedInt32Array:
 				break
 			for nx in pieces[u].next:
 				var c := cost[u] + pieces[nx].length
+				if c < cost[nx]:
+					cost[nx] = c
+					prev[nx] = u
+					heap.push(c, nx)
+			# Changing lanes: same stretch of road, plus a penalty.
+			for nx in pieces[u].beside:
+				var c := cost[u] + LANE_CHANGE_COST + maxf(0.0, pieces[nx].length - pieces[u].length)
 				if c < cost[nx]:
 					cost[nx] = c
 					prev[nx] = u

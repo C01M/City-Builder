@@ -20,6 +20,8 @@ const WARNING_ICON_PATH := "res://icons/lane_mismatch.svg"
 const WARNING_ICON_HEIGHT := 5.0
 ## Node Controller limits.
 const MAX_ROTATE := 70.0
+## Traffic lights need a junction of at least this many roads.
+const MIN_LIGHT_ROADS := 3
 ## Road length used for the width transition at a STRETCH node.
 const STRETCH_NODE_LENGTH := 12.0
 ## Default lane connections skip turns sharper than this (degrees; U-turn = 180).
@@ -70,6 +72,8 @@ class RoadNode:
 	## True if two joined lanes at this node run in opposite directions.
 	var lane_mismatch: bool = false
 	var mode: int = 0  # NodeMode
+	## Traffic lights (only work at junctions of 3 or more roads).
+	var traffic_lights: bool = false
 	var mesh_instance: MeshInstance3D
 	var warning_icon: Sprite3D
 
@@ -671,6 +675,20 @@ func set_node_mode(node_id: int, mode: NodeMode) -> void:
 	changed.emit()
 
 
+## True if the node has traffic lights switched on and enough roads for them.
+func has_traffic_lights(node_id: int) -> bool:
+	var node := get_node_data(node_id)
+	return node != null and node.traffic_lights and node.segment_ids.size() >= MIN_LIGHT_ROADS
+
+
+func set_traffic_lights(node_id: int, on: bool) -> void:
+	var node := get_node_data(node_id)
+	if node == null or node.traffic_lights == on:
+		return
+	node.traffic_lights = on
+	changed.emit()
+
+
 ## A copy of the settings of the road end of `segment_id` at `node_id`.
 func get_end_settings(node_id: int, segment_id: int) -> EndSettings:
 	var seg := get_segment(segment_id)
@@ -722,7 +740,7 @@ func copy_node_settings(node_id: int) -> Dictionary:
 	var ends: Array[EndSettings] = []
 	for e in _segment_ends(node):
 		ends.append((e.settings as EndSettings).copy())
-	return {"mode": node.mode, "ends": ends}
+	return {"mode": node.mode, "ends": ends, "traffic_lights": node.traffic_lights}
 
 
 ## Applies copied settings, matching road ends by their order around the node.
@@ -731,6 +749,7 @@ func paste_node_settings(node_id: int, data: Dictionary) -> void:
 	if node == null or data.is_empty():
 		return
 	node.mode = data.mode
+	node.traffic_lights = data.get("traffic_lights", false)
 	var copied: Array = data.ends
 	var ends := _segment_ends(node)
 	for i in ends.size():
