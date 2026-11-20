@@ -161,8 +161,12 @@ static func build(network: RoadNetwork, map_half_size: float, max_speed: float) 
 			p.node_id = seg.end_id if forward else seg.start_id
 			g.lane_pieces[p.lane_key] = p.id
 
-	# Connections through nodes.
+	# Connections through nodes. Cars leave the map at outside connections, so
+	# nobody turns around there (it would cut into the cars entering).
 	for node_id: int in network.nodes:
+		var node := network.get_node_data(node_id)
+		if node.segment_ids.size() == 1 and is_on_border(node.position, map_half_size):
+			continue
 		var by_key := {}
 		for e in network.get_lane_ends(node_id):
 			by_key[e.key] = e

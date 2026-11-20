@@ -7,8 +7,10 @@ extends Node3D
 signal hint_changed(text: String)
 ## The Node Controller's selected node or align state changed.
 signal node_tool_changed
+## The road type used for drawing and upgrading changed (e.g. picked from a road).
+signal road_type_changed
 
-enum Mode { STRAIGHT, CURVED, FREEFORM, UPGRADE, LANES, BULLDOZE, NODE }
+enum Mode { STRAIGHT, CURVED, FREEFORM, UPGRADE, LANES, BULLDOZE, NODE, LAYOUT }
 
 const MAP_HALF_SIZE := 1000.0
 const BORDER_SNAP_DISTANCE := 8.0
@@ -46,6 +48,11 @@ const COLOR_ALIGN := Color(1.0, 0.5, 0.15, 1.0)
 const COLOR_EDITED_NODE := Color(0.3, 0.7, 1.0, 0.6)
 const HANDLE_PICK_RADIUS := 1.1
 const HANDLE_Y := 0.12
+## Lane layout tool: hovering this far beside a road offers to add a lane there.
+const ADD_LANE_BAND := 2.4
+const COLOR_LAYOUT_LANE := Color(1.0, 0.85, 0.2, 0.9)
+const COLOR_LAYOUT_ADD := Color(0.35, 0.95, 0.45, 0.95)
+const COLOR_LAYOUT_REMOVE := Color(1.0, 0.3, 0.25, 0.95)
 
 const HINTS := {
 	Mode.STRAIGHT: "Left click: start / place road  ·  Right click: stop  ·  Shift: no angle/length snapping  ·  Ends at the map edge bring traffic",
@@ -55,6 +62,7 @@ const HINTS := {
 	Mode.LANES: "Click a junction, then an incoming lane (orange), then outgoing lanes (green) to toggle  ·  R: reset junction  ·  Right click: back",
 	Mode.BULLDOZE: "Left click a road to delete it",
 	Mode.NODE: "Click a junction, then drag its handles (Shift: sideways)  ·  A: align corners  ·  Ctrl+C / V: copy / paste  ·  R: reset",
+	Mode.LAYOUT: "Click a lane: reverse it  ·  Right click: remove it  ·  Click beside a road: add a lane  ·  Shift: whole street  ·  Alt: one segment  ·  Ctrl+click: draw with this layout",
 }
 
 @export var network: RoadNetwork
@@ -127,7 +135,10 @@ func set_mode(new_mode: Mode) -> void:
 
 
 func set_road_type(type: RoadType) -> void:
+	if type == road_type:
+		return
 	road_type = type
+	road_type_changed.emit()
 
 
 func cancel() -> void:
@@ -325,7 +336,7 @@ func _on_left_click() -> void:
 			if seg:
 				if seg.type != road_type:
 					network.set_segment_type(seg.id, road_type)
-				elif road_type.is_one_way():
+				elif road_type.is_reversible():
 					network.reverse_segment(seg.id)
 		Mode.BULLDOZE:
 			var seg := _segment_under_cursor()
@@ -335,6 +346,8 @@ func _on_left_click() -> void:
 			_click_lanes()
 		Mode.NODE:
 			_click_node()
+		Mode.LAYOUT:
+			_click_layout(false)
 
 
 func _on_right_click() -> void:
@@ -350,8 +363,10 @@ func _on_right_click() -> void:
 				select_node(-1)
 		Mode.UPGRADE:
 			var seg := _segment_under_cursor()
-			if seg and seg.type.is_one_way():
+			if seg and seg.type.is_reversible():
 				network.reverse_segment(seg.id)
+		Mode.LAYOUT:
+			_click_layout(true)
 		Mode.LANES:
 			if _lane_selected >= 0:
 				_lane_selected = -1
@@ -359,6 +374,55 @@ func _on_right_click() -> void:
 				_lane_node = -1
 		_:
 			cancel()
+
+
+## Lane layout tool: left click reverses the lane under the cursor or adds a lane
+## beside the road, right click removes the lane; Ctrl+click picks the layout.
+func _click_layout(right_button: bool) -> void:
+	var target := _layout_target()
+	if target.is_empty():
+		return
+	var seg := network.get_segment(target.segment_id)
+	if Input.is_key_pressed(KEY_CTRL):
+		if not right_button:
+			set_road_type(seg.type)
+		return
+	var scope := _layout_scope()
+	if target.kind == "add":
+		if not right_button:
+			network.edit_lanes(seg.id, RoadNetwork.LaneEdit.ADD_RIGHT if target.side > 0 else RoadNetwork.LaneEdit.ADD_LEFT, 0, scope)
+	elif right_button:
+		network.edit_lanes(seg.id, RoadNetwork.LaneEdit.REMOVE, target.lane, scope)
+	else:
+		network.edit_lanes(seg.id, RoadNetwork.LaneEdit.REVERSE, target.lane, scope)
+
+
+## How far lane edits reach: the road up to its junctions by default,
+## Shift: the whole street through junctions, Alt: just this segment.
+func _layout_scope() -> RoadNetwork.EditScope:
+	if Input.is_key_pressed(KEY_ALT):
+		return RoadNetwork.EditScope.SEGMENT
+	if Input.is_key_pressed(KEY_SHIFT):
+		return RoadNetwork.EditScope.STREET
+	return RoadNetwork.EditScope.ROAD
+
+
+## What the cursor points at in the lane layout tool: {} or
+## {segment_id, kind: "lane" (lane index) or "add" (side -1 left / 1 right), t}.
+func _layout_target() -> Dictionary:
+	var hit := network.find_segment_near(_cursor, ADD_LANE_BAND, true)
+	if hit.is_empty():
+		return {}
+	var seg := network.get_segment(hit.segment_id)
+	var t: float = hit.t
+	var right := seg.curve.tangent(t).cross(Vector3.UP).normalized()
+	var lateral := (_cursor - (hit.point as Vector3)).dot(right)
+	var half := seg.type.width * 0.5
+	if absf(lateral) <= half:
+		return {"segment_id": seg.id, "kind": "lane", "lane": seg.type.lane_at(lateral), "side": 0, "t": t}
+	if seg.type.lanes.size() >= RoadType.MAX_LANES:
+		return {}
+	return {"segment_id": seg.id, "kind": "add", "lane": -1, "side": 1 if lateral > 0.0 else -1, "t": t}
 
 
 func _click_draw() -> void:
@@ -614,6 +678,8 @@ func _update_visuals() -> void:
 			_draw_lanes(batch)
 		Mode.NODE:
 			_draw_node(batch)
+		Mode.LAYOUT:
+			_draw_layout(batch)
 	if not _label.visible:
 		var hover := network.find_node_near(_cursor, NODE_SNAP_RADIUS)
 		if hover >= 0 and network.has_lane_mismatch(hover):
@@ -650,8 +716,7 @@ func _draw_drawing(batch: TriBatch) -> void:
 		_preview.mesh = RoadMeshBuilder.build_strip(curve, 0.0, length, road_type.width, 0.08)
 		_preview.material_override = _preview_material(error == "")
 		_preview.visible = true
-		if road_type.is_one_way():
-			batch.arrows_along(curve.sample_points(maxi(2, ceili(length / 2.0)), 0.1), 6.0, 1.0, Color(1, 1, 1, 0.8))
+		_draw_type_arrows(batch, curve, road_type, Color(1, 1, 1, 0.8))
 	if mode == Mode.CURVED and _control != null:
 		var c: Vector3 = _control
 		batch.ribbon(PackedVector3Array([start, c, p]), 0.15, COLOR_GUIDE)
@@ -685,12 +750,11 @@ func _draw_segment_hover(batch: TriBatch) -> void:
 	if mode == Mode.UPGRADE:
 		if seg.type != road_type:
 			text = "Change to %s" % road_type.display_name
-		elif road_type.is_one_way():
+		elif road_type.is_reversible():
 			text = "Reverse direction"
 		else:
 			text = "Already a %s" % road_type.display_name.to_lower()
-	if seg.type.is_one_way():
-		batch.arrows_along(seg.curve.sample_points(maxi(2, ceili(length / 2.0)), 0.1), 6.0, 1.0, Color(1, 1, 1, 0.8))
+	_draw_type_arrows(batch, seg.curve, seg.type, Color(1, 1, 1, 0.8))
 	_show_label(text)
 
 
@@ -788,6 +852,86 @@ func _draw_node(batch: TriBatch) -> void:
 				_show_label("Drag: angle the road end")
 			"curb":
 				_show_label("Drag: curb radius (wider turn)")
+
+
+func _draw_layout(batch: TriBatch) -> void:
+	var target := _layout_target()
+	if target.is_empty():
+		return
+	var seg := network.get_segment(target.segment_id)
+	var reach := network.lane_edit_reach(seg.id, _layout_scope())
+	var picking := Input.is_key_pressed(KEY_CTRL)
+	var up := Vector3.UP * 0.05
+	for part in reach:
+		var s := network.get_segment(part.segment_id)
+		var n := s.type.lanes.size()
+		# The hovered lane, counted in this segment's own direction.
+		var hovered: int = target.lane if part.aligned else n - 1 - int(target.lane)
+		for i in n:
+			var pts := network.lane_points(s.id, i, 1.0)
+			if pts.size() < 2:
+				continue
+			for j in pts.size():
+				pts[j] += up
+			var color := COLOR_LAYOUT_LANE
+			var width := 0.2
+			if target.kind == "lane" and i == hovered and not picking:
+				color = Color.WHITE
+				width = 0.5
+			batch.ribbon(pts, width, color)
+			batch.arrows_along(pts, 5.0, 1.0, color)
+		if target.kind == "add" and not picking:
+			# Where the new lane goes.
+			var side: float = target.side if part.aligned else -target.side
+			var ghost := _offset_line(s, side * (s.type.width * 0.5 + RoadType.LANE_WIDTH * 0.5))
+			batch.ribbon(ghost, RoadType.LANE_WIDTH * 0.9, COLOR_LAYOUT_ADD * Color(1, 1, 1, 0.45))
+	var segments := "" if reach.size() == 1 else "  ·  %d segments" % reach.size()
+	if picking:
+		_show_label("Click: draw new roads as %s" % seg.type.display_name.to_lower())
+	elif target.kind == "add":
+		var at := seg.curve.point(target.t) + seg.curve.tangent(target.t).cross(Vector3.UP).normalized() \
+			* float(target.side) * (seg.type.width * 0.5 + RoadType.LANE_WIDTH * 0.5)
+		batch.disc(at + up * 2.0, 0.9, COLOR_LAYOUT_ADD)
+		batch.ribbon(PackedVector3Array([at + up * 3.0 + Vector3.LEFT * 0.55, at + up * 3.0 + Vector3.RIGHT * 0.55]), 0.22, Color.WHITE)
+		batch.ribbon(PackedVector3Array([at + up * 3.0 + Vector3.FORWARD * 0.55, at + up * 3.0 + Vector3.BACK * 0.55]), 0.22, Color.WHITE)
+		_show_label("Click: add a lane%s" % segments, COLOR_LAYOUT_ADD)
+	else:
+		var text := "Lane %d of %d  ·  Click: reverse" % [int(target.lane) + 1, seg.type.lanes.size()]
+		if seg.type.lanes.size() > 1:
+			text += "  ·  Right click: remove"
+		_show_label(text + segments)
+
+
+## Line along a segment's trimmed length, `lateral` m right of its center line.
+func _offset_line(seg: RoadNetwork.RoadSegment, lateral: float) -> PackedVector3Array:
+	var pts := PackedVector3Array()
+	var from := seg.trim_start
+	var to := seg.curve.get_length() - seg.trim_end
+	if to - from < 0.1:
+		return pts
+	var steps := maxi(1, ceili((to - from) / 1.0))
+	for i in steps + 1:
+		var t := seg.curve.t_at_distance(lerpf(from, to, float(i) / steps))
+		var p := seg.curve.point(t) + seg.curve.tangent(t).cross(Vector3.UP).normalized() * lateral
+		p.y = RoadNetwork.ROAD_Y + 0.05
+		pts.append(p)
+	return pts
+
+
+## Arrows along each lane of `type` laid along `curve`, in each lane's direction.
+func _draw_type_arrows(batch: TriBatch, curve: RoadCurve, type: RoadType, color: Color) -> void:
+	var length := curve.get_length()
+	var steps := maxi(2, ceili(length / 2.0))
+	for lane in type.lanes:
+		var pts := PackedVector3Array()
+		for i in steps + 1:
+			var t := curve.t_at_distance(length * i / steps)
+			var p := curve.point(t) + curve.tangent(t).cross(Vector3.UP).normalized() * lane.offset
+			p.y = 0.1
+			pts.append(p)
+		if not lane.forward:
+			pts.reverse()
+		batch.arrows_along(pts, 6.0, 0.8, color)
 
 
 func _preview_material(ok: bool) -> StandardMaterial3D:

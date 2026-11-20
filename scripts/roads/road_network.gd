@@ -422,6 +422,126 @@ func set_segment_type(segment_id: int, type: RoadType) -> void:
 	_segment_lanes_changed(seg)
 
 
+## Lane edits for `edit_lanes`.
+enum LaneEdit { ADD_LEFT, ADD_RIGHT, REMOVE, REVERSE }
+## How far a lane edit reaches along the road.
+##   SEGMENT  just this segment
+##   ROAD     on through nodes joining exactly two roads (up to the next junctions)
+##   STREET   also straight on through junctions
+enum EditScope { SEGMENT, ROAD, STREET }
+
+
+## Adds, removes or reverses a lane. `lane` is the lane index for REMOVE / REVERSE,
+## counted left to right along `segment_id`. Every segment in `scope` with the same
+## layout gets the same edit. Added and kept lanes stay where they are: the road
+## widens or narrows on the edited side.
+func edit_lanes(segment_id: int, edit: LaneEdit, lane: int = 0, scope: EditScope = EditScope.SEGMENT) -> bool:
+	var seg := get_segment(segment_id)
+	if seg == null:
+		return false
+	var base := seg.type.layout()
+	var result: Array[bool] = base.duplicate()
+	var lateral := 0.0  # center line move, m right of the segment direction
+	var half := RoadType.LANE_WIDTH * 0.5
+	match edit:
+		LaneEdit.ADD_LEFT, LaneEdit.ADD_RIGHT:
+			if base.size() >= RoadType.MAX_LANES:
+				return false
+			if edit == LaneEdit.ADD_LEFT:
+				result.insert(0, base[0])
+				lateral = -half
+			else:
+				result.append(base[base.size() - 1])
+				lateral = half
+		LaneEdit.REMOVE:
+			if base.size() <= 1 or lane < 0 or lane >= base.size():
+				return false
+			result.remove_at(lane)
+			lateral = half if lane == 0 else (-half if lane == base.size() - 1 else 0.0)
+		LaneEdit.REVERSE:
+			if lane < 0 or lane >= base.size():
+				return false
+			result[lane] = not result[lane]
+	for part in lane_edit_reach(segment_id, scope):
+		var s: RoadSegment = segments[part.segment_id]
+		if part.aligned:
+			_set_layout(s, result, lateral)
+		else:
+			_set_layout(s, RoadType.reversed_layout(result), -lateral)
+	_rebuild_dirty()
+	changed.emit()
+	return true
+
+
+## Segments a lane edit on `segment_id` reaches: [{segment_id, aligned}], where
+## aligned = runs the same way as `segment_id`. Only segments whose layout matches
+## (seen in the same direction) are included.
+func lane_edit_reach(segment_id: int, scope: EditScope) -> Array[Dictionary]:
+	var result: Array[Dictionary] = [{"segment_id": segment_id, "aligned": true}]
+	var seg := get_segment(segment_id)
+	if seg == null or scope == EditScope.SEGMENT:
+		return result
+	var layout := seg.type.layout()
+	var seen := {segment_id: true}
+	# Walk forward from the end node, then backward from the start node.
+	for forward_walk: bool in [true, false]:
+		var cur := seg
+		var node_id := seg.end_id if forward_walk else seg.start_id
+		while true:
+			var next := _continuing_segment(node_id, cur, scope)
+			if next == null or seen.has(next.id):
+				break
+			# The walk keeps going the same way: leaving node_id along `next`.
+			var walk_forward := next.start_id == node_id
+			var next_aligned := walk_forward == forward_walk
+			var next_layout := next.type.layout() if next_aligned else RoadType.reversed_layout(next.type.layout())
+			if next_layout != layout:
+				break
+			seen[next.id] = true
+			result.append({"segment_id": next.id, "aligned": next_aligned})
+			cur = next
+			node_id = next.end_id if walk_forward else next.start_id
+	return result
+
+
+## The segment continuing `from` through `node_id`: the only other one at a
+## two-road node, or (STREET scope) the one straight ahead at a junction.
+func _continuing_segment(node_id: int, from: RoadSegment, scope: EditScope) -> RoadSegment:
+	var node := get_node_data(node_id)
+	if node == null:
+		return null
+	var others: Array[int] = []
+	for sid in node.segment_ids:
+		if sid != from.id:
+			others.append(sid)
+	if others.size() == 1 and node.segment_ids.size() == 2:
+		return segments[others[0]]
+	if scope != EditScope.STREET:
+		return null
+	var ahead := -outward_direction(node_id, from.id)
+	var best: RoadSegment = null
+	var best_angle := 30.0
+	for sid in others:
+		var angle := rad_to_deg(ahead.angle_to(outward_direction(node_id, sid)))
+		if angle < best_angle:
+			best_angle = angle
+			best = segments[sid]
+	return best
+
+
+## Gives a segment a new lane layout and moves its center line `lateral` m to
+## the right (of the segment direction), so unchanged lanes stay in place.
+func _set_layout(seg: RoadSegment, forwards: Array[bool], lateral: float) -> void:
+	seg.type = RoadType.from_layout(forwards)
+	if absf(lateral) > 1e-6:
+		seg.start_offset += seg.curve.tangent(0.0).cross(Vector3.UP).normalized() * lateral
+		seg.end_offset += seg.curve.tangent(1.0).cross(Vector3.UP).normalized() * lateral
+		_update_segment_curve(seg)
+	for nid: int in [seg.start_id, seg.end_id]:
+		_drop_custom_for_segment(get_node_data(nid), seg.id)
+		_dirty_nodes[nid] = true
+
+
 ## Flips a segment's direction (reverses one-way traffic).
 func reverse_segment(segment_id: int) -> void:
 	var seg := get_segment(segment_id)
@@ -774,25 +894,81 @@ func lane_points(segment_id: int, lane_index: int, spacing: float = 2.0) -> Pack
 	return pts
 
 
+## Default lane connections for one incoming lane. The roads it may turn into are
+## ordered from the sharpest right turn to the sharpest left. When its road brings
+## several lanes in, the right lanes take the right turns and the left lanes the
+## left ones (every lane gets a road, every road a lane), and lanes going into the
+## same road keep their order. A single lane may take every road and lane.
 func _default_outs(incoming: LaneEnd, ends: Array[LaneEnd], allow_u_turn: bool = false) -> Array:
-	var outs := []
-	var gentle := []
+	var in_dir := _flat(incoming.direction).normalized()
+	var in_right := Vector2(-in_dir.y, in_dir.x)
 	var min_dot := cos(deg_to_rad(MAX_DEFAULT_TURN))
+	var gentle := {}  # segment id -> Array[LaneEnd]
+	var sharp := {}
 	for e in ends:
-		if not e.incoming and (e.segment_id != incoming.segment_id or allow_u_turn):
-			outs.append(e.key)
-			if e.segment_id == incoming.segment_id or _flat(incoming.direction).normalized().dot(_flat(e.direction).normalized()) >= min_dot:
-				gentle.append(e.key)
+		if e.incoming or (e.segment_id == incoming.segment_id and not allow_u_turn):
+			continue
+		var ok := e.segment_id == incoming.segment_id or in_dir.dot(_flat(e.direction).normalized()) >= min_dot
+		((gentle if ok else sharp).get_or_add(e.segment_id, []) as Array).append(e)
 	# Leave out hairpins (e.g. from the main road back into a tight exit), unless
 	# that's the only way on (a road that bends back sharply at a node).
-	if not gentle.is_empty():
-		return gentle
-	if outs.is_empty():
+	var targets: Dictionary = gentle if not gentle.is_empty() else sharp
+	if targets.is_empty():
 		# Dead end: allow turning around.
 		for e in ends:
 			if not e.incoming:
-				outs.append(e.key)
+				(targets.get_or_add(e.segment_id, []) as Array).append(e)
+	# Roads from the sharpest right turn to the sharpest left (a U-turn is last).
+	var order: Array = targets.keys()
+	var turn := {}
+	for sid: int in order:
+		var d := _flat((targets[sid][0] as LaneEnd).direction).normalized()
+		turn[sid] = -PI if sid == incoming.segment_id else atan2(d.dot(in_right), d.dot(in_dir))
+	order.sort_custom(func(a: int, b: int) -> bool: return turn[a] > turn[b])
+	# This lane's place among its road's incoming lanes, right to left.
+	var group: Array[LaneEnd] = []
+	for e in ends:
+		if e.incoming and e.segment_id == incoming.segment_id:
+			group.append(e)
+	_sort_right_to_left(group)
+	var i := group.find(incoming)
+	var m := group.size()
+	var k := order.size()
+	var outs := []
+	for j in k:
+		if not _shares_part(i, m, j, k):
+			continue
+		# The incoming lanes heading for road j, and this lane's place among them.
+		var lanes_to_j := 0
+		var p := 0
+		for ii in m:
+			if _shares_part(ii, m, j, k):
+				if ii < i:
+					p += 1
+				lanes_to_j += 1
+		var target_lanes: Array[LaneEnd] = []
+		target_lanes.assign(targets[order[j]])
+		_sort_right_to_left(target_lanes)
+		var c := target_lanes.size()
+		for q in c:
+			if _shares_part(p, lanes_to_j, q, c):
+				outs.append(target_lanes[q].key)
 	return outs
+
+
+## True if part `a` of `na` equal parts of [0, 1] overlaps part `b` of `nb`.
+static func _shares_part(a: int, na: int, b: int, nb: int) -> bool:
+	return a * nb < (b + 1) * na and b * na < (a + 1) * nb
+
+
+## Sorts lane ends from the rightmost to the leftmost, looking along their travel direction.
+static func _sort_right_to_left(lanes: Array[LaneEnd]) -> void:
+	if lanes.is_empty():
+		return
+	var d := _flat(lanes[0].direction).normalized()
+	var right := Vector2(-d.y, d.x)
+	lanes.sort_custom(func(a: LaneEnd, b: LaneEnd) -> bool:
+		return _flat(a.position).dot(right) > _flat(b.position).dot(right))
 
 
 # ---------------------------------------------------------------- internals

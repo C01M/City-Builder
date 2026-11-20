@@ -19,6 +19,7 @@ func _initialize() -> void:
 	_test_straight_road()
 	_test_crossing()
 	_test_edited_crossing()
+	_test_multi_lane()
 	_test_bend_slows_cars()
 	_test_one_way()
 	_test_network_change_while_driving()
@@ -170,6 +171,28 @@ func _test_edited_crossing() -> void:
 	_check(traffic.completed_trips >= 40, "edited crossing: traffic flows (%d trips)" % traffic.completed_trips)
 	_check(stats.inside_waits > 0, "edited crossing: cars pull into the junction to wait for crossing traffic")
 	_check_limits(stats, "edited crossing")
+	net.free()
+	traffic.free()
+
+
+## A four-lane road crossing a two-way road; its east piece gets a third
+## eastbound lane.
+func _test_multi_lane() -> void:
+	var setup := _setup(5.0)
+	var net: RoadNetwork = setup[0]
+	var traffic: TrafficManager = setup[1]
+	net.build_road(RoadCurve.straight(Vector3(-HALF, 0, 0), Vector3(HALF, 0, 0)), RoadType.get_type(&"four_lane"))
+	net.build_road(RoadCurve.straight(Vector3(0, 0, -HALF), Vector3(0, 0, HALF)), _two)
+	var east: int = net.find_segment_near(Vector3(100, 0, 0), 1.0).segment_id
+	net.edit_lanes(east, RoadNetwork.LaneEdit.ADD_RIGHT)
+	var stats := _run(traffic, 200.0)
+	_check(traffic.completed_trips >= 60, "multi-lane: traffic flows (%d trips)" % traffic.completed_trips)
+	var used_lanes := {}
+	for p in traffic.graph.pieces:
+		if not p.is_connection and RoadNetwork.key_segment(p.lane_key) == east:
+			used_lanes[p.lane_key] = true
+	_check(used_lanes.size() == 5, "multi-lane: the widened piece has 5 lanes in the traffic graph")
+	_check_limits(stats, "multi-lane")
 	net.free()
 	traffic.free()
 

@@ -18,6 +18,9 @@ func _initialize() -> void:
 	_test_upgrade()
 	_test_lane_snapping()
 	_test_tight_exit()
+	_test_lane_editing()
+	_test_lane_edit_scope()
+	_test_multi_lane_connections()
 	_test_node_offset_rotate_shift()
 	_test_curb_radius()
 	_test_align_corner()
@@ -274,6 +277,129 @@ func _test_tight_exit() -> void:
 	var outs := _outs(bend, b, _incoming_key(bend, b, first))
 	_check(outs.size() == 1 and RoadNetwork.key_segment(outs[0]) == second, "sharp bend: lanes still continue around it")
 	bend.free()
+
+
+## Lane positions (z at x = 0) and directions of an east-west segment, left to right.
+func _lanes_across(net: RoadNetwork, sid: int) -> Array:
+	var seg := net.get_segment(sid)
+	var result := []
+	for i in seg.type.lanes.size():
+		var pts := net.lane_points(sid, i)
+		var mid := pts[pts.size() / 2]
+		result.append([snappedf(mid.z, 0.01), seg.type.lanes[i].forward])
+	return result
+
+
+func _test_lane_editing() -> void:
+	var net := _new_net()
+	net.build_road(RoadCurve.straight(Vector3(-50, 0, 0), Vector3(50, 0, 0)), _two)
+	var sid: int = net.segments.keys()[0]
+	# Heading east, the right side is +z: westbound lane at z = -1.5, eastbound at +1.5.
+	_check(_lanes_across(net, sid) == [[-1.5, false], [1.5, true]], "two-way lanes before editing")
+	net.edit_lanes(sid, RoadNetwork.LaneEdit.ADD_RIGHT)
+	_check(_lanes_across(net, sid) == [[-1.5, false], [1.5, true], [4.5, true]],
+		"added lane on the right; the others stay put (got %s)" % [_lanes_across(net, sid)])
+	_check(net.get_segment(sid).type.width == 9.0, "road is 9 m wide with 3 lanes")
+	net.edit_lanes(sid, RoadNetwork.LaneEdit.ADD_LEFT)
+	_check(_lanes_across(net, sid) == [[-4.5, false], [-1.5, false], [1.5, true], [4.5, true]],
+		"added lane on the left (got %s)" % [_lanes_across(net, sid)])
+	_check(net.get_segment(sid).type == RoadType.get_type(&"four_lane"), "2 + 2 lanes is the four-lane preset")
+	net.edit_lanes(sid, RoadNetwork.LaneEdit.REVERSE, 1)
+	_check(_lanes_across(net, sid) == [[-4.5, false], [-1.5, true], [1.5, true], [4.5, true]],
+		"reversed the second lane (got %s)" % [_lanes_across(net, sid)])
+	net.edit_lanes(sid, RoadNetwork.LaneEdit.REMOVE, 0)
+	_check(_lanes_across(net, sid) == [[-1.5, true], [1.5, true], [4.5, true]],
+		"removed the left lane; the others stay put (got %s)" % [_lanes_across(net, sid)])
+	_check(net.get_segment(sid).type.is_one_way(), "three eastbound lanes make a one-way")
+	net.edit_lanes(sid, RoadNetwork.LaneEdit.REMOVE, 1)
+	_check(_lanes_across(net, sid) == [[0.0, true], [3.0, true]],
+		"removing a middle lane closes the gap from both sides (got %s)" % [_lanes_across(net, sid)])
+	net.edit_lanes(sid, RoadNetwork.LaneEdit.REMOVE, 0)
+	_check(not net.edit_lanes(sid, RoadNetwork.LaneEdit.REMOVE, 0), "the last lane can't be removed")
+	for i in RoadType.MAX_LANES - 1:
+		net.edit_lanes(sid, RoadNetwork.LaneEdit.ADD_RIGHT)
+	_check(not net.edit_lanes(sid, RoadNetwork.LaneEdit.ADD_RIGHT), "at most %d lanes" % RoadType.MAX_LANES)
+	_check(RoadType.from_layout([true, false, true]) == RoadType.from_layout([true, false, true]), "one type per layout")
+	net.free()
+
+
+## Road: (-100) -- n1 (-40) -- crossing (30) -- (100) along x, the first piece drawn backwards.
+func _test_lane_edit_scope() -> void:
+	var net := _new_net()
+	net.build_road(RoadCurve.straight(Vector3(-40, 0, 0), Vector3(-100, 0, 0)), _two)
+	var n1 := net.find_node_near(Vector3(-40, 0, 0), 0.1)
+	net.build_road(RoadCurve.straight(Vector3(-40, 0, 0), Vector3(100, 0, 0)), _two, {"node": n1})
+	net.build_road(RoadCurve.straight(Vector3(30, 0, -60), Vector3(30, 0, 60)), _two)
+	var west := _seg_at(net, Vector3(-70, 0, 0))
+	var middle := _seg_at(net, Vector3(0, 0, 0))
+	var east := _seg_at(net, Vector3(60, 0, 0))
+	net.edit_lanes(middle, RoadNetwork.LaneEdit.ADD_RIGHT, 0, RoadNetwork.EditScope.ROAD)
+	_check(net.get_segment(middle).type.lanes.size() == 3 and net.get_segment(west).type.lanes.size() == 3,
+		"road scope: the lane is added up to the junction")
+	_check(net.get_segment(east).type.lanes.size() == 2, "road scope: stops at the crossing")
+	_check(net.get_segment(west).type.layout() == RoadType.reversed_layout(net.get_segment(middle).type.layout()),
+		"a segment drawn the other way gets the mirrored layout")
+	_check(_lanes_meet(net, n1), "lanes still meet at the node between the edited segments")
+	net.edit_lanes(middle, RoadNetwork.LaneEdit.ADD_RIGHT, 0, RoadNetwork.EditScope.SEGMENT)
+	_check(net.get_segment(middle).type.lanes.size() == 4 and net.get_segment(west).type.lanes.size() == 3,
+		"segment scope: only the clicked segment")
+	net.edit_lanes(east, RoadNetwork.LaneEdit.ADD_RIGHT, 0, RoadNetwork.EditScope.STREET)
+	net.edit_lanes(middle, RoadNetwork.LaneEdit.REMOVE, 3, RoadNetwork.EditScope.SEGMENT)
+	net.edit_lanes(middle, RoadNetwork.LaneEdit.REVERSE, 0, RoadNetwork.EditScope.STREET)
+	_check(net.get_segment(east).type.layout() == [true, true, true] and net.get_segment(west).type.layout() == [false, false, false],
+		"street scope: through the crossing and the node (east %s, west %s)" % [net.get_segment(east).type.layout(), net.get_segment(west).type.layout()])
+	net.free()
+
+
+## True if every lane end of one segment at the node has a lane end of the other at the same spot.
+func _lanes_meet(net: RoadNetwork, node_id: int) -> bool:
+	var ends := net.get_lane_ends(node_id)
+	for a in ends:
+		var found := false
+		for b in ends:
+			if b.segment_id != a.segment_id and a.position.distance_to(b.position) < 0.1 and a.incoming != b.incoming:
+				found = true
+		if not found:
+			return false
+	return true
+
+
+func _test_multi_lane_connections() -> void:
+	var four := RoadType.get_type(&"four_lane")
+	var net := _new_net()
+	net.build_road(RoadCurve.straight(Vector3(-60, 0, 0), Vector3(60, 0, 0)), four)
+	net.build_road(RoadCurve.straight(Vector3(0, 0, -60), Vector3(0, 0, 60)), four)
+	var c := net.find_node_near(Vector3.ZERO, 0.1)
+	var west := _seg_at(net, Vector3(-30, 0, 0))
+	var east := _seg_at(net, Vector3(30, 0, 0))
+	var north := _seg_at(net, Vector3(0, 0, -30))
+	var south := _seg_at(net, Vector3(0, 0, 30))
+	# Eastbound lanes arriving from the west, right lane (z = 4.5) first.
+	var lanes: Array = net.get_lane_ends(c).filter(func(e: RoadNetwork.LaneEnd) -> bool: return e.incoming and e.segment_id == west)
+	lanes.sort_custom(func(a: RoadNetwork.LaneEnd, b: RoadNetwork.LaneEnd) -> bool: return a.position.z > b.position.z)
+	var right_outs := _outs(net, c, lanes[0].key)
+	var left_outs := _outs(net, c, lanes[1].key)
+	var segs := func(outs: Array) -> Array:
+		var s := []
+		for k: int in outs:
+			if not s.has(RoadNetwork.key_segment(k)):
+				s.append(RoadNetwork.key_segment(k))
+		s.sort()
+		return s
+	# Heading east, a right turn goes south (+z).
+	var right_expected := [east, south]
+	right_expected.sort()
+	_check(segs.call(right_outs) == right_expected, "right lane: right turn and straight on (got %s)" % [segs.call(right_outs)])
+	var left_expected := [east, north]
+	left_expected.sort()
+	_check(segs.call(left_outs) == left_expected, "left lane: straight on and left turn (got %s)" % [segs.call(left_outs)])
+	var straight_right := right_outs.filter(func(k: int) -> bool: return RoadNetwork.key_segment(k) == east)
+	var straight_left := left_outs.filter(func(k: int) -> bool: return RoadNetwork.key_segment(k) == east)
+	_check(straight_right.size() == 1 and straight_left.size() == 1 and straight_right[0] != straight_left[0],
+		"straight on, each lane keeps to its own lane")
+	_check(net.get_lane_ends(c).filter(func(e: RoadNetwork.LaneEnd) -> bool: return e.key == straight_right[0])[0].position.z > 2.0,
+		"the right lane continues in the right lane")
+	net.free()
 
 
 ## Vector2i(road points no mesh covers, junction points off every road), on a
@@ -557,3 +683,7 @@ func _test_node_settings_survive_edits() -> void:
 	_check(net.get_node_data(c).segment_ids.size() == 4, "road removed")
 	_check(net.get_node_data(c).mesh_instance != null, "junction still has a surface")
 	net.free()
+
+
+func _seg_at(net: RoadNetwork, pos: Vector3) -> int:
+	return net.find_segment_near(pos, 1.0).get("segment_id", -1)

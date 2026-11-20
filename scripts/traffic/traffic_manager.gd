@@ -297,6 +297,10 @@ func _acceleration(car: Car) -> float:
 	var junction_checked := false
 	## Where the car has to stop for a junction (distance from its front).
 	var stop := INF
+	## Cars beyond this don't matter yet: the car waits at its stop point first.
+	## While the junction is still far off, its stop line isn't a real stop yet,
+	## so cars waiting inside it count (otherwise they'd appear suddenly).
+	var horizon := INF
 	var k := car.index
 	while k < car.route.size() and to_piece < LOOKAHEAD:
 		var p := graph.pieces[car.route[k]]
@@ -315,6 +319,8 @@ func _acceleration(car: Car) -> float:
 		if p.is_connection and not p.zones.is_empty() and stop == INF and not junction_checked:
 			junction_checked = k > car.index
 			stop = _junction_stop(car, p, k, to_piece)
+			if k == car.index or to_piece - STOP_LINE_MARGIN < JUNCTION_REQUEST_DISTANCE:
+				horizon = stop
 			if stop < INF:
 				var va := JUNCTION_APPROACH_SPEED
 				approach = minf(approach, sqrt(va * va + 2.0 * COMFORT_DECEL * stop))
@@ -331,7 +337,7 @@ func _acceleration(car: Car) -> float:
 				if other == car or (k == car.index and other.s <= car.s):
 					continue
 				var gap := to_piece + other.s - CAR_LENGTH
-				if gap <= stop:
+				if gap <= horizon:
 					var term := _idm_interaction(v, gap, v - other.v, TIME_HEADWAY)
 					if term < accel:
 						accel = term
@@ -349,13 +355,13 @@ func _acceleration(car: Car) -> float:
 					var other: Car = list[0]
 					if other.s < CAR_LENGTH:
 						var gap := to_piece + p.length + other.s - CAR_LENGTH
-						if gap <= stop:
+						if gap <= horizon:
 							var term := _idm_interaction(v, gap, v - other.v, TIME_HEADWAY)
 							if term < accel:
 								accel = term
 								car.limit = "leader"
 						leader_found = true
-			if to_piece + p.length > stop:
+			if to_piece + p.length > horizon:
 				leader_found = true
 		to_piece += p.length
 		k += 1

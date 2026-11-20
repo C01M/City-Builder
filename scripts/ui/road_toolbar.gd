@@ -43,9 +43,26 @@ func _ready() -> void:
 	column.add_child(row)
 
 	var type_group := ButtonGroup.new()
+	var type_buttons := {}
 	for type in RoadType.all_types():
-		_add_toggle(row, type.display_name, type_group, type == tool.road_type,
+		type_buttons[type] = _add_toggle(row, type.display_name, type_group, type == tool.road_type,
 			func() -> void: tool.set_road_type(type))
+	# A layout picked from a road (Ctrl+click with the Lanes tool).
+	var picked: Array[RoadType] = [null]
+	var custom := _add_toggle(row, "", type_group, false, func() -> void:
+		if picked[0]:
+			tool.set_road_type(picked[0]))
+	custom.visible = false
+	tool.road_type_changed.connect(func() -> void:
+		var t := tool.road_type
+		if type_buttons.has(t):
+			(type_buttons[t] as Button).set_pressed_no_signal(true)
+			return
+		picked[0] = t
+		custom.text = t.display_name
+		custom.tooltip_text = "Layout picked from a road"
+		custom.visible = true
+		custom.set_pressed_no_signal(true))
 	row.add_child(VSeparator.new())
 
 	var tool_group := ButtonGroup.new()
@@ -54,7 +71,8 @@ func _ready() -> void:
 		["Curved", RoadTool.Mode.CURVED],
 		["Freeform", RoadTool.Mode.FREEFORM],
 		["Upgrade", RoadTool.Mode.UPGRADE],
-		["Lanes", RoadTool.Mode.LANES],
+		["Lanes", RoadTool.Mode.LAYOUT],
+		["Connections", RoadTool.Mode.LANES],
 		["Node", RoadTool.Mode.NODE],
 		["Bulldoze", RoadTool.Mode.BULLDOZE],
 	]
@@ -127,7 +145,7 @@ func _build_traffic_panel() -> void:
 	column.add_child(hint)
 
 
-func _add_toggle(parent: Control, text: String, group: ButtonGroup, pressed: bool, on_press: Callable) -> void:
+func _add_toggle(parent: Control, text: String, group: ButtonGroup, pressed: bool, on_press: Callable) -> Button:
 	var b := Button.new()
 	b.text = text
 	b.toggle_mode = true
@@ -136,3 +154,4 @@ func _add_toggle(parent: Control, text: String, group: ButtonGroup, pressed: boo
 	b.focus_mode = Control.FOCUS_NONE
 	b.pressed.connect(on_press)
 	parent.add_child(b)
+	return b
