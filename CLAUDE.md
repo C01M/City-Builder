@@ -1,8 +1,10 @@
 # City-Builder (Godot)
 
 - Engine: Godot 4.7.2 (Forward Plus renderer, Jolt Physics, Vulkan). Use Godot 4.x GDScript syntax, never 3.x.
-- Godot executable: `C:\Users\user1\Downloads\Godot_v4.7.2-stable_win64.exe`
+- Project folder: `E:\Godot\Projects\City-Builder`
+- Godot executable: `E:\Godot\Godot_v4.7.2-stable_win64.exe`
   - This is the GUI build, so it doesn't print to the terminal. Use `--log-file` to capture output.
+  - `E:\Godot\Godot_v4.7.2-stable_win64_console.exe` is the console build, which prints to the terminal.
 - Main scene: `res://scenes/main.tscn`, a flat 2 km × 2 km grass plain (centered on the origin, ground at y=0) with a sun, sky and an RTS camera (`scripts/camera_rig.gd`: WASD/arrows pan, wheel zoom, middle mouse rotate).
 
 ## Road system (`scripts/roads/`)
@@ -45,7 +47,7 @@ Import or validate the project headlessly and read the log (PowerShell):
 
 ```powershell
 $log="$env:TEMP\godot_check.log"
-Start-Process "C:\Users\user1\Downloads\Godot_v4.7.2-stable_win64.exe" -ArgumentList '--headless','--path','"C:\Users\user1\Documents\city-builder"','--import','--log-file',"`"$log`"" -Wait -NoNewWindow
+Start-Process "E:\Godot\Godot_v4.7.2-stable_win64.exe" -ArgumentList '--headless','--path','"E:\Godot\Projects\City-Builder"','--import','--log-file',"`"$log`"" -Wait -NoNewWindow
 Get-Content $log
 ```
 
