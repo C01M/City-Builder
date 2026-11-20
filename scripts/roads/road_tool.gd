@@ -8,6 +8,7 @@ signal hint_changed(text: String)
 enum Mode { STRAIGHT, CURVED, FREEFORM, UPGRADE, LANES, BULLDOZE }
 
 const MAP_HALF_SIZE := 1000.0
+const BORDER_SNAP_DISTANCE := 8.0
 const NODE_SNAP_RADIUS := 5.0
 const SEGMENT_SNAP_EXTRA := 1.0
 const MIN_ROAD_LENGTH := 4.0
@@ -29,6 +30,7 @@ const COLOR_GUIDE := Color(1, 1, 1, 0.7)
 const COLOR_SNAP_NODE := Color(0.3, 1.0, 0.4, 0.9)
 const COLOR_SNAP_SEGMENT := Color(0.3, 0.9, 1.0, 0.9)
 const COLOR_SNAP_LANE := Color(1.0, 0.85, 0.2, 0.95)
+const COLOR_SNAP_BORDER := Color(0.35, 0.7, 1.0, 0.95)
 const COLOR_WARNING := Color(1.0, 0.77, 0.0)
 const COLOR_LANE_IN := Color(1.0, 0.6, 0.1, 0.95)
 const COLOR_LANE_OUT := Color(0.3, 0.95, 0.4, 0.95)
@@ -36,7 +38,7 @@ const COLOR_CONNECTION := Color(0.3, 0.85, 1.0, 0.35)
 const COLOR_CONNECTION_SELECTED := Color(1.0, 1.0, 0.3, 0.95)
 
 const HINTS := {
-	Mode.STRAIGHT: "Left click: start / place road  ·  Right click: stop  ·  Hold Shift: no angle/length snapping",
+	Mode.STRAIGHT: "Left click: start / place road  ·  Right click: stop  ·  Shift: no angle/length snapping  ·  Ends at the map edge bring traffic",
 	Mode.CURVED: "Click start, then the curve's control point, then the end  ·  Right click: stop",
 	Mode.FREEFORM: "Click start, then click to lay smoothly connected curves  ·  Right click: stop",
 	Mode.UPGRADE: "Left click a road: change it to the selected type (same one-way type: reverse)  ·  Right click: reverse one-way",
@@ -263,11 +265,20 @@ func _compute_snap(raw: Vector3, allow_network: bool) -> Dictionary:
 	var pos := raw
 	if _has_start and grid_snap and not Input.is_key_pressed(KEY_SHIFT):
 		pos = _grid_snap(_snap_anchor(), raw)
-	return _make_snap(pos, pos, -1, false)
+	# Road ends near the map edge snap onto it and become outside connections.
+	var on_border := false
+	if allow_network:
+		for axis in [0, 2]:
+			if absf(pos[axis]) > MAP_HALF_SIZE - BORDER_SNAP_DISTANCE:
+				pos[axis] = signf(pos[axis]) * MAP_HALF_SIZE
+				on_border = true
+	var snap := _make_snap(pos, pos, -1, false)
+	snap.border = on_border
+	return snap
 
 
 func _make_snap(pos: Vector3, anchor: Vector3, node: int, on_segment: bool) -> Dictionary:
-	return {"pos": pos, "anchor": anchor, "node": node, "on_segment": on_segment, "lane_dir": Vector3.ZERO}
+	return {"pos": pos, "anchor": anchor, "node": node, "on_segment": on_segment, "lane_dir": Vector3.ZERO, "border": false}
 
 
 ## Moves the snap to a lane center if one is closer to the mouse than the road center.
@@ -439,8 +450,12 @@ func _draw_drawing(batch: TriBatch) -> void:
 		snap_color = COLOR_SNAP_NODE
 	elif _snap.on_segment:
 		snap_color = COLOR_SNAP_SEGMENT
+	elif _snap.border:
+		snap_color = COLOR_SNAP_BORDER
 	batch.ring(p, 1.6 if lane_dir == Vector3.ZERO else 1.2, 0.3, snap_color)
 	if not _has_start:
+		if _snap.border:
+			_show_label("Outside connection", COLOR_SNAP_BORDER)
 		return
 
 	var start: Vector3 = _start.pos
@@ -469,6 +484,8 @@ func _draw_drawing(batch: TriBatch) -> void:
 			or (not placing_control and _is_lane_mismatch(_snap, curve.tangent(1.0)))):
 		text += "\n" + MISMATCH_TEXT
 		color = COLOR_WARNING
+	elif _snap.border and not placing_control:
+		text += "\nOutside connection"
 	_show_label(text, color)
 
 

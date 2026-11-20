@@ -19,10 +19,20 @@ Node/segment graph with lane-level connections (Cities: Skylines style). Traffic
 - `road_tool.gd`: `RoadTool` input modes (straight/curved/freeform drawing, upgrade/reverse, lanes, bulldoze), snapping (nodes, segments, soft 15° / 8 m grid) and previews.
 - `road_overlay.gd` (lane debug view), `tri_batch.gd` (gizmo triangles), `road_mesh_builder.gd`, `scripts/ui/road_toolbar.gd` (UI built in code, forced LTR).
 
+## Traffic (`scripts/traffic/`)
+
+- Outside connections: dead-end nodes on the map border (within 3 m of ±`map_half_size`). The road tool snaps ends within 8 m of the edge onto it. Each lane leaving one spawns cars (slider: cars/min per entry lane) that route to a random other outside connection.
+- `traffic_graph.gd`: `TrafficGraph`, rebuilt from the network on every `changed`. It has lane pieces and junction connection pieces (polylines with per-point curve speed limits from `LATERAL_ACCEL`), Dijkstra routing with a cache, and per-junction `conflicts` (paths that cross, come too close, share an exit lane, or diverge from the same entry lane).
+- `traffic_manager.gd`: `TrafficManager`. Cars use IDM car following (70 km/h, 2.5 m/s² accel, 3 m/s² comfortable braking, 1.2 s headway) plus anticipatory braking for curves and junctions ahead. At junctions with conflicts a car must reserve its path (first come, first served; exit lane must have room); until then it approaches at ≤ 20 km/h and asks within 35 m. Reservations are released once the car's tail leaves the junction. On network changes, cars are projected onto the new graph and re-routed, or removed.
+- `step(delta)` drives the simulation (called from `_physics_process`) and works without the scene tree, so tests call it directly.
+- An unsignalized 4-way carries roughly 20–25 cars/min, similar to an all-way stop. Higher demand queues back to the entries, where spawning waits.
+
 ## Tests
 
 - `tests/test_roads.gd`: headless network tests. Run with `-s res://tests/test_roads.gd` (add `--headless --path ... --log-file ...` as above). It prints `ROAD TESTS: PASS` and exits 0. Run `--import` first after adding new `class_name` scripts.
+- `tests/test_traffic.gd`: headless traffic tests on a 400 m map (trips complete, no car overlaps via an oriented-box check, speed/accel limits, no emergency braking, bends slow cars, one-way direction, network edits while driving). Prints `TRAFFIC TESTS: PASS`. Takes about 20 s.
 - `tests/demo_roads.gd`: sample network with the overlay and lane tool on, for rendered frames.
+- `tests/demo_traffic.gd`: border-to-border roads with 150 s of pre-simulated traffic and a fixed camera, for rendered frames.
 
 ## Rendering a test frame
 

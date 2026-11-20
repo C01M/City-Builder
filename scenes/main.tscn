@@ -5,6 +5,7 @@
 [ext_resource type="Script" path="res://scripts/roads/road_overlay.gd" id="3_overlay"]
 [ext_resource type="Script" path="res://scripts/roads/road_tool.gd" id="4_roadtool"]
 [ext_resource type="Script" path="res://scripts/ui/road_toolbar.gd" id="5_toolbar"]
+[ext_resource type="Script" path="res://scripts/traffic/traffic_manager.gd" id="6_traffic"]
 
 [sub_resource type="ProceduralSkyMaterial" id="SkyMat_1"]
 sky_horizon_color = Color(0.66, 0.72, 0.8, 1)
@@ -87,7 +88,12 @@ network = NodePath("../RoadNetwork")
 script = ExtResource("4_roadtool")
 network = NodePath("../RoadNetwork")
 
-[node name="RoadToolbar" type="CanvasLayer" parent="." node_paths=PackedStringArray("tool", "overlay")]
+[node name="TrafficManager" type="Node3D" parent="." node_paths=PackedStringArray("network")]
+script = ExtResource("6_traffic")
+network = NodePath("../RoadNetwork")
+
+[node name="RoadToolbar" type="CanvasLayer" parent="." node_paths=PackedStringArray("tool", "overlay", "traffic")]
 script = ExtResource("5_toolbar")
 tool = NodePath("../RoadTool")
 overlay = NodePath("../RoadOverlay")
+traffic = NodePath("../TrafficManager")

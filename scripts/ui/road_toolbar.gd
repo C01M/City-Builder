@@ -3,8 +3,10 @@ extends CanvasLayer
 
 @export var tool: RoadTool
 @export var overlay: RoadOverlay
+@export var traffic: TrafficManager
 
 var _hint: Label
+var _traffic_stats: Label
 
 
 func _ready() -> void:
@@ -71,6 +73,53 @@ func _ready() -> void:
 	lanes.button_pressed = overlay.visible
 	lanes.toggled.connect(func(on: bool) -> void: overlay.visible = on)
 	row.add_child(lanes)
+
+	if traffic:
+		_build_traffic_panel()
+
+
+func _process(_delta: float) -> void:
+	if _traffic_stats and traffic:
+		_traffic_stats.text = "%d cars driving  ·  %d trips done" % [traffic.cars.size(), traffic.completed_trips]
+
+
+## Top-left panel: spawn rate slider and traffic stats.
+func _build_traffic_panel() -> void:
+	var panel := PanelContainer.new()
+	panel.layout_direction = Control.LAYOUT_DIRECTION_LTR
+	panel.position = Vector2(12, 12)
+	add_child(panel)
+	var margin := MarginContainer.new()
+	for side in ["left", "right", "top", "bottom"]:
+		margin.add_theme_constant_override("margin_" + side, 8)
+	panel.add_child(margin)
+	var column := VBoxContainer.new()
+	margin.add_child(column)
+
+	var rate_label := Label.new()
+	column.add_child(rate_label)
+	var slider := HSlider.new()
+	slider.min_value = 0
+	slider.max_value = 30
+	slider.step = 1
+	slider.value = traffic.spawn_rate
+	slider.custom_minimum_size.x = 220
+	slider.focus_mode = Control.FOCUS_NONE
+	var show_rate := func(value: float) -> void:
+		rate_label.text = "Traffic: %d cars/min per entry lane" % value if value > 0 else "Traffic: off"
+	show_rate.call(slider.value)
+	slider.value_changed.connect(func(value: float) -> void:
+		traffic.set_spawn_rate(value)
+		show_rate.call(value))
+	column.add_child(slider)
+
+	_traffic_stats = Label.new()
+	_traffic_stats.modulate = Color(1, 1, 1, 0.75)
+	column.add_child(_traffic_stats)
+	var hint := Label.new()
+	hint.text = "Connect roads to the map edge to bring in traffic"
+	hint.modulate = Color(1, 1, 1, 0.5)
+	column.add_child(hint)
 
 
 func _add_toggle(parent: Control, text: String, group: ButtonGroup, pressed: bool, on_press: Callable) -> void:

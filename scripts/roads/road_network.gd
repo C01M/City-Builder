@@ -441,7 +441,9 @@ func reset_connections(node_id: int) -> void:
 
 ## Path a vehicle takes through a junction from one lane to another.
 static func connection_curve(from: LaneEnd, to: LaneEnd) -> RoadCurve:
-	var k := maxf(from.position.distance_to(to.position) * 0.4, 1.5)
+	# Handle length scales with the gap, so a zero-length connection (lanes that
+	# meet exactly) stays a point instead of looping back on itself.
+	var k := from.position.distance_to(to.position) * 0.45
 	return RoadCurve.new(from.position, from.position + from.direction * k,
 		to.position - to.direction * k, to.position)
 
