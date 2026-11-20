@@ -16,6 +16,7 @@ func _initialize() -> void:
 	_test_remove_and_reverse()
 	_test_curved_crossing()
 	_test_upgrade()
+	_test_lane_snapping()
 	print("ROAD TESTS: %s (%d failures)" % ["PASS" if _failures == 0 else "FAIL", _failures])
 	quit(1 if _failures > 0 else 0)
 
@@ -86,7 +87,7 @@ func _test_t_junction_and_lane_connections() -> void:
 	var net := _new_net()
 	net.build_road(RoadCurve.straight(Vector3(-50, 0, 0), Vector3(50, 0, 0)), _two)
 	# One-way road from the north, ending on the middle of the two-way road.
-	net.build_road(RoadCurve.straight(Vector3(20, 0, -40), Vector3(20, 0, 0)), _one, -1, -1, false, true)
+	net.build_road(RoadCurve.straight(Vector3(20, 0, -40), Vector3(20, 0, 0)), _one, {}, {"on_segment": true})
 	_check(net.nodes.size() == 4 and net.segments.size() == 3, "T junction: 4 nodes, 3 segments")
 	var j := net.find_node_near(Vector3(20, 0, 0), 0.5)
 	_check(j >= 0, "T junction node exists")
@@ -132,7 +133,7 @@ func _test_t_junction_and_lane_connections() -> void:
 func _test_remove_and_reverse() -> void:
 	var net := _new_net()
 	net.build_road(RoadCurve.straight(Vector3(-50, 0, 0), Vector3(50, 0, 0)), _two)
-	net.build_road(RoadCurve.straight(Vector3(0, 0, -40), Vector3(0, 0, 0)), _one, -1, -1, false, true)
+	net.build_road(RoadCurve.straight(Vector3(0, 0, -40), Vector3(0, 0, 0)), _one, {}, {"on_segment": true})
 	var j := net.find_node_near(Vector3.ZERO, 0.5)
 	var oneway := -1
 	for sid in net.get_node_data(j).segment_ids:
@@ -174,3 +175,48 @@ func _test_upgrade() -> void:
 	var end_node := net.get_segment(sid).end_id
 	_check(net.get_connections(end_node).size() == 1, "one-way ends with one incoming lane")
 	net.free()
+
+
+func _test_lane_snapping() -> void:
+	var net := _new_net()
+	# Two-way road heading east, ending at the origin. Its eastbound lane is at z = +1.5.
+	net.build_road(RoadCurve.straight(Vector3(-50, 0, 0), Vector3.ZERO), _two)
+	var n := net.find_node_near(Vector3.ZERO, 0.1)
+	var two_way: int = net.get_node_data(n).segment_ids[0]
+	_check(net.node_lane_points(n).size() == 2, "two-way end offers 2 lane snap points")
+	var at_node := {"node": n, "anchor": Vector3.ZERO}
+
+	# Divided road: one-way continuing the eastbound lane, one-way feeding the westbound lane.
+	net.build_road(RoadCurve.straight(Vector3(0, 0, 1.5), Vector3(40, 0, 10)), _one, at_node)
+	net.build_road(RoadCurve.straight(Vector3(40, 0, -10), Vector3(0, 0, -1.5)), _one, {}, at_node)
+	_check(net.nodes.size() == 4, "lane-snapped roads share the existing node (got %d nodes)" % net.nodes.size())
+	_check(net.get_node_data(n).segment_ids.size() == 3, "node has the two-way and both one-ways")
+	_check(not net.has_lane_mismatch(n), "matching lane directions: no warning")
+	_check(net.get_node_data(n).warning_icon == null, "no warning icon without a mismatch")
+
+	var eastbound := -1
+	for sid in net.get_node_data(n).segment_ids:
+		var seg := net.get_segment(sid)
+		if seg.type == _one and seg.start_id == n:
+			eastbound = sid
+			_check(seg.start_offset.distance_to(Vector3(0, 0, 1.5)) < 0.01, "one-way keeps its lane offset (got %s)" % seg.start_offset)
+	var outs := _outs(net, n, _incoming_key(net, n, two_way))
+	_check(outs.size() == 1 and RoadNetwork.key_segment(outs[0]) == eastbound,
+		"eastbound lane continues only into the eastbound one-way")
+
+	# Flip the eastbound one-way: it now runs against the lane it's attached to.
+	net.reverse_segment(eastbound)
+	_check(net.has_lane_mismatch(n), "reversed one-way on the lane: mismatch detected")
+	_check(net.get_node_data(n).warning_icon != null, "mismatch shows a warning icon")
+	net.reverse_segment(eastbound)
+	_check(not net.has_lane_mismatch(n) and net.get_node_data(n).warning_icon == null, "fixing the direction clears the warning")
+
+	# A one-way attached at the road's center never counts as a mismatch.
+	var c := _new_net()
+	c.build_road(RoadCurve.straight(Vector3(-50, 0, 0), Vector3.ZERO), _two)
+	var cn := c.find_node_near(Vector3.ZERO, 0.1)
+	c.build_road(RoadCurve.straight(Vector3(40, 0, 0), Vector3.ZERO), _one, {}, {"node": cn})
+	_check(not c.has_lane_mismatch(cn), "center-attached one-way: no mismatch")
+	_check(c.get_segment(c.get_node_data(cn).segment_ids[1]).end_offset == Vector3.ZERO, "center attach has no offset")
+	net.free()
+	c.free()

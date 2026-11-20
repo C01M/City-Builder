@@ -14,6 +14,10 @@ const JUNCTION_MARGIN := 2.0
 const MAX_TRIM_FRACTION := 0.45
 const LANE_BITS := 6
 const LANE_MASK := 63
+## Lanes of different segments closer than this at a node count as joined.
+const LANE_ALIGN_DISTANCE := 0.5
+const WARNING_ICON_PATH := "res://icons/lane_mismatch.svg"
+const WARNING_ICON_HEIGHT := 5.0
 
 
 class RoadNode:
@@ -22,7 +26,10 @@ class RoadNode:
 	var segment_ids: Array[int] = []
 	## Overrides per incoming lane key: Array of outgoing lane keys.
 	var custom_connections: Dictionary = {}
+	## True if two joined lanes at this node run in opposite directions.
+	var lane_mismatch: bool = false
 	var mesh_instance: MeshInstance3D
+	var warning_icon: Sprite3D
 
 
 class RoadSegment:
@@ -34,7 +41,14 @@ class RoadSegment:
 	## Distance cut from each end to make room for the junction surface.
 	var trim_start: float = 0.0
 	var trim_end: float = 0.0
+	## Where each end attaches relative to its node (non-zero when a narrower
+	## road is snapped to one lane of a wider road instead of its center).
+	var start_offset: Vector3 = Vector3.ZERO
+	var end_offset: Vector3 = Vector3.ZERO
 	var mesh_instance: MeshInstance3D
+
+	func offset_at(node_id: int) -> Vector3:
+		return start_offset if node_id == start_id else end_offset
 
 
 ## One lane's end at a node (after trimming for the junction).
@@ -56,6 +70,7 @@ var _next_node_id: int = 1
 var _next_segment_id: int = 1
 var _dirty_nodes: Dictionary = {}
 var _material: StandardMaterial3D
+var _warning_texture: Texture2D
 
 
 func _init() -> void:
@@ -131,24 +146,78 @@ func continue_direction(node_id: int) -> Vector3:
 	return -outward_direction(node_id, node.segment_ids[0])
 
 
-## Smallest angle (degrees) between `dir` and the roads leaving `node_id`.
-func min_angle_at_node(node_id: int, dir: Vector3) -> float:
+## Smallest angle (degrees) between a new road leaving `node_id` along `dir`
+## (attached at `offset`, `half_width` wide) and the roads already there.
+## Roads that sit fully side by side with it (e.g. on the other lane) are ignored.
+func min_angle_at_node(node_id: int, dir: Vector3, offset: Vector3 = Vector3.ZERO, half_width: float = 0.0) -> float:
 	var best := 180.0
 	var node := get_node_data(node_id)
 	if node == null:
 		return best
+	var across := dir.cross(Vector3.UP).normalized()
 	for sid in node.segment_ids:
+		var seg: RoadSegment = segments[sid]
+		var separation := absf((offset - seg.offset_at(node_id)).dot(across))
+		if separation >= half_width + seg.type.width * 0.5 - 0.1:
+			continue
 		best = minf(best, rad_to_deg(dir.angle_to(outward_direction(node_id, sid))))
 	return best
 
 
+## Lane centers at a node where a one-lane road can attach, as
+## [{pos: Vector3, dir: Vector3 lane travel direction}]. Only multi-lane roads offer them.
+func node_lane_points(node_id: int) -> Array[Dictionary]:
+	var result: Array[Dictionary] = []
+	var node := get_node_data(node_id)
+	if node == null:
+		return result
+	for sid in node.segment_ids:
+		var seg: RoadSegment = segments[sid]
+		if seg.type.lanes.size() < 2:
+			continue
+		for lp in _lane_points_at(seg, 0.0 if seg.start_id == node_id else 1.0):
+			var seen := false
+			for existing in result:
+				if (existing.pos as Vector3).distance_to(lp.pos) < LANE_ALIGN_DISTANCE:
+					seen = true
+			if not seen:
+				result.append(lp)
+	return result
+
+
+## Lane centers across a segment at curve parameter `t` (see node_lane_points).
+func segment_lane_points(segment_id: int, t: float) -> Array[Dictionary]:
+	var seg := get_segment(segment_id)
+	if seg == null or seg.type.lanes.size() < 2:
+		return []
+	return _lane_points_at(seg, t)
+
+
+func has_lane_mismatch(node_id: int) -> bool:
+	var node := get_node_data(node_id)
+	return node != null and node.lane_mismatch
+
+
+func _lane_points_at(seg: RoadSegment, t: float) -> Array[Dictionary]:
+	var result: Array[Dictionary] = []
+	var p := seg.curve.point(t)
+	var tan := seg.curve.tangent(t)
+	var right := tan.cross(Vector3.UP).normalized()
+	for lane in seg.type.lanes:
+		result.append({"pos": p + right * lane.offset, "dir": tan if lane.forward else -tan})
+	return result
+
+
 # ---------------------------------------------------------------- editing
 
-## Builds a road along `curve`. Each end connects to the given node (>= 0),
-## splits the segment under it when `*_on_segment` is set, or gets a new node.
+## Builds a road along `curve`. `start` / `end` describe what each end attaches to:
+##   node: int        existing node to connect to (default -1)
+##   on_segment: bool split the segment under `anchor` to make a junction
+##   anchor: Vector3  node / center line point (default: the curve's end point)
+## Otherwise the end gets a new node. If the curve's end point differs from the
+## node's position (snapped to a lane), the segment keeps that offset.
 ## Existing roads that the curve crosses are split into junctions.
-func build_road(curve: RoadCurve, type: RoadType, start_node: int = -1, end_node: int = -1,
-		start_on_segment: bool = false, end_on_segment: bool = false) -> bool:
+func build_road(curve: RoadCurve, type: RoadType, start: Dictionary = {}, end: Dictionary = {}) -> bool:
 	var length := curve.get_length()
 	if length < 1.0:
 		return false
@@ -162,7 +231,8 @@ func build_road(curve: RoadCurve, type: RoadType, start_node: int = -1, end_node
 				hits.append(pair[0])
 	hits.sort()
 
-	var chain_nodes: Array[int] = [_resolve_point(curve.p0, start_node, start_on_segment)]
+	var start_id := _resolve_point(start.get("anchor", curve.p0), start.get("node", -1), start.get("on_segment", false))
+	var chain_nodes: Array[int] = [start_id]
 	var chain_ts: Array[float] = []
 	var last_d := 0.0
 	for t in hits:
@@ -175,7 +245,7 @@ func build_road(curve: RoadCurve, type: RoadType, start_node: int = -1, end_node
 		chain_nodes.append(nid)
 		chain_ts.append(t)
 		last_d = d
-	var end_id := _resolve_point(curve.p3, end_node, end_on_segment)
+	var end_id := _resolve_point(end.get("anchor", curve.p3), end.get("node", -1), end.get("on_segment", false))
 	if chain_nodes.size() > 1 and chain_nodes.back() == end_id:
 		chain_nodes.pop_back()
 		chain_ts.pop_back()
@@ -195,11 +265,14 @@ func build_road(curve: RoadCurve, type: RoadType, start_node: int = -1, end_node
 		consumed = t
 	pieces.append(rest)
 
+	var last := pieces.size() - 1
 	for i in pieces.size():
 		var a := chain_nodes[i]
 		var b := chain_nodes[i + 1]
 		if a != b and not _has_similar_segment(a, b, pieces[i]):
-			_create_segment(a, b, pieces[i], type)
+			_create_segment(a, b, pieces[i], type,
+				_end_offset(curve.p0, a) if i == 0 else Vector3.ZERO,
+				_end_offset(curve.p3, b) if i == last else Vector3.ZERO)
 
 	_remove_orphan_nodes()
 	_rebuild_dirty()
@@ -219,12 +292,14 @@ func split_segment(segment_id: int, t: float) -> int:
 	_next_segment_id += 1
 	tail.start_id = mid_id
 	tail.end_id = seg.end_id
-	tail.curve = parts[1].with_endpoints(get_node_data(mid_id).position, end_node.position)
+	tail.end_offset = seg.end_offset
+	tail.curve = parts[1].with_endpoints(get_node_data(mid_id).position, end_node.position + tail.end_offset)
 	tail.type = seg.type
 	segments[tail.id] = tail
 
-	seg.curve = parts[0].with_endpoints(get_node_data(seg.start_id).position, get_node_data(mid_id).position)
+	seg.curve = parts[0].with_endpoints(get_node_data(seg.start_id).position + seg.start_offset, get_node_data(mid_id).position)
 	seg.end_id = mid_id
+	seg.end_offset = Vector3.ZERO
 
 	end_node.segment_ids[end_node.segment_ids.find(segment_id)] = tail.id
 	_remap_custom(end_node, segment_id, tail.id)
@@ -260,6 +335,11 @@ func set_segment_type(segment_id: int, type: RoadType) -> void:
 	if seg == null or seg.type == type:
 		return
 	seg.type = type
+	if type.lanes.size() > 1 and (seg.start_offset != Vector3.ZERO or seg.end_offset != Vector3.ZERO):
+		# Multi-lane roads attach at node centers.
+		seg.start_offset = Vector3.ZERO
+		seg.end_offset = Vector3.ZERO
+		seg.curve = seg.curve.with_endpoints(get_node_data(seg.start_id).position, get_node_data(seg.end_id).position)
 	_segment_lanes_changed(seg)
 
 
@@ -275,6 +355,9 @@ func reverse_segment(segment_id: int) -> void:
 	var t := seg.trim_start
 	seg.trim_start = seg.trim_end
 	seg.trim_end = t
+	var o := seg.start_offset
+	seg.start_offset = seg.end_offset
+	seg.end_offset = o
 	_segment_lanes_changed(seg)
 
 
@@ -426,13 +509,22 @@ func _create_node(pos: Vector3) -> int:
 	return n.id
 
 
-func _create_segment(a: int, b: int, curve: RoadCurve, type: RoadType) -> int:
+func _end_offset(point: Vector3, node_id: int) -> Vector3:
+	var off := point - get_node_data(node_id).position
+	off.y = 0.0
+	return off if off.length() > 0.05 else Vector3.ZERO
+
+
+func _create_segment(a: int, b: int, curve: RoadCurve, type: RoadType,
+		start_offset: Vector3 = Vector3.ZERO, end_offset: Vector3 = Vector3.ZERO) -> int:
 	var s := RoadSegment.new()
 	s.id = _next_segment_id
 	_next_segment_id += 1
 	s.start_id = a
 	s.end_id = b
-	s.curve = curve.with_endpoints(get_node_data(a).position, get_node_data(b).position)
+	s.start_offset = start_offset
+	s.end_offset = end_offset
+	s.curve = curve.with_endpoints(get_node_data(a).position + start_offset, get_node_data(b).position + end_offset)
 	s.type = type
 	segments[s.id] = s
 	get_node_data(a).segment_ids.append(s.id)
@@ -457,6 +549,8 @@ func _remove_orphan_nodes() -> void:
 		if node.segment_ids.is_empty():
 			if node.mesh_instance:
 				node.mesh_instance.queue_free()
+			if node.warning_icon:
+				node.warning_icon.queue_free()
 			nodes.erase(node.id)
 			_dirty_nodes.erase(node.id)
 
@@ -510,6 +604,7 @@ func _rebuild_dirty() -> void:
 		var node := get_node_data(nid)
 		if node:
 			_build_junction_mesh(node)
+			_update_lane_mismatch(node)
 	for sid: int in dirty_segments:
 		_build_segment_mesh(segments[sid])
 	_dirty_nodes.clear()
@@ -522,16 +617,28 @@ func _segment_ends(node: RoadNode) -> Array[Dictionary]:
 		var seg: RoadSegment = segments[sid]
 		var dir := outward_direction(node.id, sid)
 		var d2 := Vector2(dir.x, dir.z).normalized()
+		var right := Vector2(-d2.y, d2.x)  # points toward increasing angle
+		var off := seg.offset_at(node.id)
+		var origin := Vector2(off.x, off.z)
+		var angle := d2.angle()
+		if angle < -PI + 0.01:
+			angle += TAU
 		ends.append({
 			"seg": seg,
 			"at_start": seg.start_id == node.id,
 			"dir": d2,
-			"right": Vector2(-d2.y, d2.x),  # points toward increasing angle
+			"right": right,
+			"origin": origin,  # where the segment's center line starts, relative to the node
+			"lateral": origin.dot(right),
 			"half": seg.type.width * 0.5,
-			"angle": d2.angle(),
+			"angle": angle,
 			"trim": 0.0,
 		})
-	ends.sort_custom(func(a: Dictionary, b: Dictionary) -> bool: return a.angle < b.angle)
+	# Parallel roads side by side (e.g. one-ways on both lanes) sort by lateral position.
+	ends.sort_custom(func(a: Dictionary, b: Dictionary) -> bool:
+		if absf(a.angle - b.angle) > 0.01:
+			return a.angle < b.angle
+		return a.lateral < b.lateral)
 	return ends
 
 
@@ -544,12 +651,14 @@ func _compute_trims(node: RoadNode) -> void:
 			var a := ends[i]
 			var b := ends[(i + 1) % n]
 			# a's right edge faces b's left edge.
-			var hit: Variant = _line_intersection(a.right * a.half, a.dir, -b.right * b.half, b.dir)
+			var hit: Variant = _line_intersection(a.origin + a.right * a.half, a.dir, b.origin - b.right * b.half, b.dir)
 			if hit != null and hit.x > 0.0 and hit.y > 0.0:
 				a.trim = maxf(a.trim, hit.x)
 				b.trim = maxf(b.trim, hit.y)
 	var margin := JUNCTION_MARGIN if n >= 3 else 0.0
-	var width_change := n == 2 and absf(ends[0].half - ends[1].half) > 0.01
+	# Centered roads of different widths get a taper; a road snapped to a lane doesn't need one.
+	var width_change := n == 2 and absf(ends[0].half - ends[1].half) > 0.01 \
+		and (ends[0].origin as Vector2).length() < 0.05 and (ends[1].origin as Vector2).length() < 0.05
 	for e in ends:
 		var trim: float = e.trim + margin
 		if width_change:
@@ -594,6 +703,43 @@ func _build_junction_mesh(node: RoadNode) -> void:
 		if poly.size() >= 3 and absf(_polygon_area(poly)) > 0.05:
 			mesh = RoadMeshBuilder.build_polygon(poly, ROAD_Y)
 	node.mesh_instance = _apply_mesh(node.mesh_instance, mesh)
+
+
+## Flags the node when lanes of different segments meet at the same spot but
+## run in opposite directions (e.g. a one-way snapped to the wrong lane).
+func _update_lane_mismatch(node: RoadNode) -> void:
+	var lanes: Array[Dictionary] = []
+	for sid in node.segment_ids:
+		var seg: RoadSegment = segments[sid]
+		for lp in _lane_points_at(seg, 0.0 if seg.start_id == node.id else 1.0):
+			lp.segment_id = sid
+			lanes.append(lp)
+	node.lane_mismatch = false
+	for i in lanes.size():
+		for j in range(i + 1, lanes.size()):
+			var a := lanes[i]
+			var b := lanes[j]
+			if a.segment_id != b.segment_id \
+					and (a.pos as Vector3).distance_to(b.pos) < LANE_ALIGN_DISTANCE \
+					and (a.dir as Vector3).dot(b.dir) < -0.5:
+				node.lane_mismatch = true
+	if node.lane_mismatch:
+		if node.warning_icon == null:
+			if _warning_texture == null:
+				_warning_texture = load(WARNING_ICON_PATH)
+			var icon := Sprite3D.new()
+			icon.texture = _warning_texture
+			icon.billboard = BaseMaterial3D.BILLBOARD_ENABLED
+			icon.no_depth_test = true
+			icon.fixed_size = true
+			icon.pixel_size = 0.0008
+			icon.render_priority = 20
+			add_child(icon)
+			node.warning_icon = icon
+		node.warning_icon.position = node.position + Vector3.UP * WARNING_ICON_HEIGHT
+	elif node.warning_icon:
+		node.warning_icon.queue_free()
+		node.warning_icon = null
 
 
 func _build_segment_mesh(seg: RoadSegment) -> void:

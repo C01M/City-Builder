@@ -13,6 +13,9 @@ const SEGMENT_SNAP_EXTRA := 1.0
 const MIN_ROAD_LENGTH := 4.0
 const MAX_TURN_DEGREES := 120.0
 const MIN_JUNCTION_ANGLE := 25.0
+## A road snapped to a lane may branch off at a shallow angle (like a ramp).
+const MIN_LANE_BRANCH_ANGLE := 5.0
+const MISMATCH_TEXT := "Lane direction mismatch: this road runs against the lane it joins"
 const ANGLE_STEP := 15.0
 const ANGLE_SNAP_TOLERANCE := 4.0
 const LENGTH_STEP := 8.0
@@ -25,6 +28,8 @@ const COLOR_BAD := Color(1.0, 0.25, 0.2, 0.55)
 const COLOR_GUIDE := Color(1, 1, 1, 0.7)
 const COLOR_SNAP_NODE := Color(0.3, 1.0, 0.4, 0.9)
 const COLOR_SNAP_SEGMENT := Color(0.3, 0.9, 1.0, 0.9)
+const COLOR_SNAP_LANE := Color(1.0, 0.85, 0.2, 0.95)
+const COLOR_WARNING := Color(1.0, 0.77, 0.0)
 const COLOR_LANE_IN := Color(1.0, 0.6, 0.1, 0.95)
 const COLOR_LANE_OUT := Color(0.3, 0.95, 0.4, 0.95)
 const COLOR_CONNECTION := Color(0.3, 0.85, 1.0, 0.35)
@@ -45,7 +50,10 @@ var mode: Mode = Mode.STRAIGHT
 var road_type: RoadType
 var grid_snap: bool = true
 
-# Drawing state. A snap is {pos: Vector3, node: int, on_segment: bool}.
+# Drawing state. A snap is {pos, anchor, node, on_segment, lane_dir}:
+#   pos      where the road end goes (a lane center when snapped to a lane)
+#   anchor   the node position / center line point it attaches to
+#   lane_dir travel direction of the snapped lane (zero if not lane-snapped)
 var _has_start := false
 var _start: Dictionary = {}
 var _control: Variant = null
@@ -185,12 +193,17 @@ func _click_draw() -> void:
 	var curve := _proposed_curve(_snap.pos)
 	if _validate(curve, _snap) != "":
 		return
-	if not network.build_road(curve, road_type, _start.node, _snap.node, _start.on_segment, _snap.on_segment):
+	if not network.build_road(curve, road_type, _start, _snap):
 		return
 	# Keep drawing from the end of the new road.
-	var end_pos: Vector3 = _snap.pos
-	var end_node := network.find_node_near(end_pos, 0.5)
-	_start = {"pos": end_pos, "node": end_node, "on_segment": false}
+	var end_node := network.find_node_near(_snap.anchor, 0.5)
+	_start = {
+		"pos": _snap.pos,
+		"anchor": network.get_node_data(end_node).position if end_node >= 0 else _snap.pos,
+		"node": end_node,
+		"on_segment": false,
+		"lane_dir": _snap.lane_dir,
+	}
 	_start_tangent = curve.tangent(1.0)
 	_start_ref = _start_tangent
 	_control = null
@@ -224,23 +237,59 @@ func _init_start_directions() -> void:
 			if node and not node.segment_ids.is_empty():
 				_start_ref = network.outward_direction(node.id, node.segment_ids[0])
 	elif _start.on_segment:
-		var hit := network.find_segment_near(_start.pos, 0.75)
+		var hit := network.find_segment_near(_start.anchor, 0.75)
 		if not hit.is_empty():
 			_start_ref = network.get_segment(hit.segment_id).curve.tangent(hit.t)
 
 
+## Snaps to nodes and roads (and, for one-lane roads, to whichever lane center
+## of a wider road is closest to the mouse), otherwise to the angle/length grid.
 func _compute_snap(raw: Vector3, allow_network: bool) -> Dictionary:
 	if allow_network:
+		var lane_snapping := road_type.lanes.size() == 1
 		var nid := network.find_node_near(raw, NODE_SNAP_RADIUS)
 		if nid >= 0:
-			return {"pos": network.get_node_data(nid).position, "node": nid, "on_segment": false}
+			var node_pos := network.get_node_data(nid).position
+			var snap := _make_snap(node_pos, node_pos, nid, false)
+			if lane_snapping:
+				_snap_to_closest_lane(snap, raw, network.node_lane_points(nid))
+			return snap
 		var hit := network.find_segment_near(raw, SEGMENT_SNAP_EXTRA, true)
 		if not hit.is_empty():
-			return {"pos": hit.point, "node": -1, "on_segment": true}
+			var snap := _make_snap(hit.point, hit.point, -1, true)
+			if lane_snapping:
+				_snap_to_closest_lane(snap, raw, network.segment_lane_points(hit.segment_id, hit.t))
+			return snap
 	var pos := raw
 	if _has_start and grid_snap and not Input.is_key_pressed(KEY_SHIFT):
 		pos = _grid_snap(_snap_anchor(), raw)
-	return {"pos": pos, "node": -1, "on_segment": false}
+	return _make_snap(pos, pos, -1, false)
+
+
+func _make_snap(pos: Vector3, anchor: Vector3, node: int, on_segment: bool) -> Dictionary:
+	return {"pos": pos, "anchor": anchor, "node": node, "on_segment": on_segment, "lane_dir": Vector3.ZERO}
+
+
+## Moves the snap to a lane center if one is closer to the mouse than the road center.
+func _snap_to_closest_lane(snap: Dictionary, raw: Vector3, lane_points: Array[Dictionary]) -> void:
+	var best_d := _flat_distance(raw, snap.anchor)
+	for lp in lane_points:
+		var d := _flat_distance(raw, lp.pos)
+		if d < best_d:
+			best_d = d
+			snap.pos = lp.pos
+			snap.lane_dir = lp.dir
+
+
+static func _flat_distance(a: Vector3, b: Vector3) -> float:
+	return Vector2(a.x, a.z).distance_to(Vector2(b.x, b.z))
+
+
+## True if a one-lane road leaving/arriving along `travel_dir` at a lane-snapped
+## end runs against that lane's traffic.
+static func _is_lane_mismatch(snap: Dictionary, travel_dir: Vector3) -> bool:
+	var lane_dir: Vector3 = snap.lane_dir
+	return lane_dir != Vector3.ZERO and travel_dir.dot(lane_dir) < -0.5
 
 
 func _snap_anchor() -> Vector3:
@@ -295,18 +344,22 @@ func _validate(curve: RoadCurve, end_snap: Dictionary) -> String:
 		return "Can't connect a node to itself"
 	if rad_to_deg(curve.tangent(0.0).angle_to(curve.tangent(1.0))) > MAX_TURN_DEGREES:
 		return "Curve too sharp"
-	if _junction_angle(_start, curve.tangent(0.0)) < MIN_JUNCTION_ANGLE \
-			or _junction_angle(end_snap, -curve.tangent(1.0)) < MIN_JUNCTION_ANGLE:
+	if _junction_angle(_start, curve.tangent(0.0)) < _min_angle_for(_start) \
+			or _junction_angle(end_snap, -curve.tangent(1.0)) < _min_angle_for(end_snap):
 		return "Angle to existing road too small"
 	return ""
+
+
+func _min_angle_for(snap: Dictionary) -> float:
+	return MIN_LANE_BRANCH_ANGLE if (snap.lane_dir as Vector3) != Vector3.ZERO else MIN_JUNCTION_ANGLE
 
 
 ## Smallest angle between a new road leaving `snap` along `dir` and roads already there.
 func _junction_angle(snap: Dictionary, dir: Vector3) -> float:
 	if snap.node >= 0:
-		return network.min_angle_at_node(snap.node, dir)
+		return network.min_angle_at_node(snap.node, dir, (snap.pos as Vector3) - (snap.anchor as Vector3), road_type.width * 0.5)
 	if snap.on_segment:
-		var hit := network.find_segment_near(snap.pos, 0.75)
+		var hit := network.find_segment_near(snap.anchor, 0.75)
 		if not hit.is_empty():
 			var tan := network.get_segment(hit.segment_id).curve.tangent(hit.t)
 			return rad_to_deg(minf(dir.angle_to(tan), dir.angle_to(-tan)))
@@ -366,6 +419,10 @@ func _update_visuals() -> void:
 			_draw_segment_hover(batch)
 		Mode.LANES:
 			_draw_lanes(batch)
+	if not _label.visible:
+		var hover := network.find_node_near(_cursor, NODE_SNAP_RADIUS)
+		if hover >= 0 and network.has_lane_mismatch(hover):
+			_show_label(MISMATCH_TEXT, COLOR_WARNING)
 	batch.commit(im, _gizmo_material)
 
 
@@ -374,11 +431,15 @@ func _draw_drawing(batch: TriBatch) -> void:
 	_snap = _compute_snap(_cursor, not placing_control)
 	var p: Vector3 = _snap.pos
 	var snap_color := COLOR_GUIDE
-	if _snap.node >= 0:
+	var lane_dir: Vector3 = _snap.lane_dir
+	if lane_dir != Vector3.ZERO:
+		snap_color = COLOR_SNAP_LANE
+		batch.arrow(p + lane_dir * 2.4, lane_dir, 0.9, COLOR_SNAP_LANE)  # which way the lane flows
+	elif _snap.node >= 0:
 		snap_color = COLOR_SNAP_NODE
 	elif _snap.on_segment:
 		snap_color = COLOR_SNAP_SEGMENT
-	batch.ring(p, 1.6, 0.3, snap_color)
+	batch.ring(p, 1.6 if lane_dir == Vector3.ZERO else 1.2, 0.3, snap_color)
 	if not _has_start:
 		return
 
@@ -401,9 +462,14 @@ func _draw_drawing(batch: TriBatch) -> void:
 	var ref := _snap_reference() if _snap_reference().length_squared() > 1e-6 else Vector3.RIGHT
 	var angle := rad_to_deg(absf(wrapf(atan2(dir.z, dir.x) - atan2(ref.z, ref.x), -PI, PI)))
 	var text := "%.0f m  ·  %.0f°" % [length, angle]
+	var color := Color.WHITE
 	if error != "":
 		text += "\n" + error
-	_show_label(text)
+	elif road_type.is_one_way() and (_is_lane_mismatch(_start, curve.tangent(0.0))
+			or (not placing_control and _is_lane_mismatch(_snap, curve.tangent(1.0)))):
+		text += "\n" + MISMATCH_TEXT
+		color = COLOR_WARNING
+	_show_label(text, color)
 
 
 func _draw_segment_hover(batch: TriBatch) -> void:
@@ -477,7 +543,8 @@ func _preview_material(ok: bool) -> StandardMaterial3D:
 	return m
 
 
-func _show_label(text: String) -> void:
+func _show_label(text: String, color: Color = Color.WHITE) -> void:
 	_label.text = text
+	_label.add_theme_color_override("font_color", color)
 	_label.position = get_viewport().get_mouse_position() + Vector2(18, 18)
 	_label.visible = true
