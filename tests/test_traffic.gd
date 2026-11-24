@@ -20,6 +20,7 @@ func _initialize() -> void:
 	_test_crossing()
 	_test_edited_crossing()
 	_test_multi_lane()
+	_test_slip_lane()
 	_test_lane_changes()
 	_test_overtaking()
 	_test_traffic_lights()
@@ -180,6 +181,45 @@ func _test_edited_crossing() -> void:
 
 ## A four-lane road crossing a two-way road; its east piece gets a third
 ## eastbound lane.
+## Road V runs north to a corner, road H east from it, both to the map edge. A
+## one-way slip lane leaves V's northbound lane tangentially and merges into H's
+## eastbound lane tangentially, so cars from V to H skip the corner.
+func _test_slip_lane() -> void:
+	var setup := _setup(10.0)
+	var net: RoadNetwork = setup[0]
+	var traffic: TrafficManager = setup[1]
+	net.build_road(RoadCurve.straight(Vector3(-50, 0, HALF), Vector3(-50, 0, -50)), _two)
+	var corner := net.find_node_near(Vector3(-50, 0, -50), 0.1)
+	net.build_road(RoadCurve.straight(Vector3(-50, 0, -50), Vector3(HALF, 0, -50)), _two, {"node": corner})
+	net.build_road(RoadCurve.quadratic(Vector3(-48.5, 0, 0), Vector3(-48.5, 0, -48.5), Vector3(0, 0, -48.5)), _one,
+		{"on_segment": true, "anchor": Vector3(-50, 0, 0)}, {"on_segment": true, "anchor": Vector3(0, 0, -50)})
+	var slip := -1
+	for sid: int in net.segments:
+		if net.get_segment(sid).type == _one:
+			slip = sid
+	var on_slip := {}
+	var corner_turns := {}
+	var stats := {}
+	for i in 180:
+		_run(traffic, 1.0, stats)
+		for car in traffic.cars:
+			var p: TrafficGraph.Piece = traffic.graph.pieces[car.route[car.index]]
+			if p.is_connection:
+				continue
+			if RoadNetwork.key_segment(p.lane_key) == slip:
+				on_slip[car.id] = true
+			elif p.node_id == corner and p.points[-1].z < p.points[0].z - 1.0:
+				# Northbound into the corner: this car missed the slip lane.
+				corner_turns[car.id] = true
+	print("slip lane: %d trips, %d cars on the slip lane, %d past it" % [traffic.completed_trips, on_slip.size(), corner_turns.size()])
+	_check(traffic.completed_trips >= 30, "slip lane: traffic flows (%d trips)" % traffic.completed_trips)
+	_check(on_slip.size() >= 20, "slip lane: cars from V to H take the slip lane (%d cars)" % on_slip.size())
+	_check(corner_turns.is_empty(), "slip lane: no car from V drives on to the corner (%d)" % corner_turns.size())
+	_check_limits(stats, "slip lane")
+	net.free()
+	traffic.free()
+
+
 func _test_multi_lane() -> void:
 	var setup := _setup(5.0)
 	var net: RoadNetwork = setup[0]

@@ -26,6 +26,8 @@ const MIN_LIGHT_ROADS := 3
 const STRETCH_NODE_LENGTH := 12.0
 ## Default lane connections skip turns sharper than this (degrees; U-turn = 180).
 const MAX_DEFAULT_TURN := 135.0
+## Default connections rank turns by where each road heads over this many meters.
+const TURN_JUDGE_DISTANCE := 15.0
 
 ## How a node joins its roads (Node Controller). MIDDLE and STRETCH only apply
 ## to nodes with exactly two roads; elsewhere they act like AUTO.
@@ -242,18 +244,18 @@ func min_angle_at_node(node_id: int, dir: Vector3, offset: Vector3 = Vector3.ZER
 	return best
 
 
-## Lane centers at a node where a one-lane road can attach, as
-## [{pos: Vector3, dir: Vector3 lane travel direction}]. Only multi-lane roads offer them.
-func node_lane_points(node_id: int) -> Array[Dictionary]:
+## Where a one-way road `lane_count` lanes wide can attach at a node so its lanes
+## line up with lanes of a wider road there: the centers of every `lane_count`
+## neighboring lanes that run the same way, as [{pos: Vector3, dir: Vector3 lane
+## travel direction}]. Only roads with more lanes than that offer them.
+func node_lane_points(node_id: int, lane_count: int = 1) -> Array[Dictionary]:
 	var result: Array[Dictionary] = []
 	var node := get_node_data(node_id)
 	if node == null:
 		return result
 	for sid in node.segment_ids:
 		var seg: RoadSegment = segments[sid]
-		if seg.type.lanes.size() < 2:
-			continue
-		for lp in _lane_points_at(seg, 0.0 if seg.start_id == node_id else 1.0):
+		for lp in _lane_points_at(seg, 0.0 if seg.start_id == node_id else 1.0, lane_count):
 			var seen := false
 			for existing in result:
 				if (existing.pos as Vector3).distance_to(lp.pos) < LANE_ALIGN_DISTANCE:
@@ -263,12 +265,12 @@ func node_lane_points(node_id: int) -> Array[Dictionary]:
 	return result
 
 
-## Lane centers across a segment at curve parameter `t` (see node_lane_points).
-func segment_lane_points(segment_id: int, t: float) -> Array[Dictionary]:
+## Lane group centers across a segment at curve parameter `t` (see node_lane_points).
+func segment_lane_points(segment_id: int, t: float, lane_count: int = 1) -> Array[Dictionary]:
 	var seg := get_segment(segment_id)
-	if seg == null or seg.type.lanes.size() < 2:
+	if seg == null:
 		return []
-	return _lane_points_at(seg, t)
+	return _lane_points_at(seg, t, lane_count)
 
 
 func has_lane_mismatch(node_id: int) -> bool:
@@ -276,13 +278,26 @@ func has_lane_mismatch(node_id: int) -> bool:
 	return node != null and node.lane_mismatch
 
 
-func _lane_points_at(seg: RoadSegment, t: float) -> Array[Dictionary]:
+## Each lane's center and travel direction at `t`. With `group` > 1: the center
+## of every `group` neighboring lanes running the same way (none unless the road
+## has more lanes than that).
+func _lane_points_at(seg: RoadSegment, t: float, group: int = 0) -> Array[Dictionary]:
 	var result: Array[Dictionary] = []
+	var lanes := seg.type.lanes
+	if group > 0 and lanes.size() <= group:
+		return result
 	var p := seg.curve.point(t)
 	var tan := seg.curve.tangent(t)
 	var right := tan.cross(Vector3.UP).normalized()
-	for lane in seg.type.lanes:
-		result.append({"pos": p + right * lane.offset, "dir": tan if lane.forward else -tan})
+	var size := maxi(group, 1)
+	for i in lanes.size() - size + 1:
+		var same := true
+		var offset := 0.0
+		for j in size:
+			same = same and lanes[i + j].forward == lanes[i].forward
+			offset += lanes[i + j].offset / size
+		if same:
+			result.append({"pos": p + right * offset, "dir": tan if lanes[i].forward else -tan})
 	return result
 
 
@@ -617,7 +632,7 @@ func get_connections(node_id: int) -> Dictionary:
 		if node.custom_connections.has(e.key):
 			result[e.key] = (node.custom_connections[e.key] as Array).duplicate()
 		else:
-			result[e.key] = _default_outs(e, ends, node.mode == NodeMode.UTURN)
+			result[e.key] = _default_outs(node_id, e, ends, node.mode == NodeMode.UTURN)
 	return result
 
 
@@ -918,7 +933,7 @@ func lane_points(segment_id: int, lane_index: int, spacing: float = 2.0) -> Pack
 ## several lanes in, the right lanes take the right turns and the left lanes the
 ## left ones (every lane gets a road, every road a lane), and lanes going into the
 ## same road keep their order. A single lane may take every road and lane.
-func _default_outs(incoming: LaneEnd, ends: Array[LaneEnd], allow_u_turn: bool = false) -> Array:
+func _default_outs(node_id: int, incoming: LaneEnd, ends: Array[LaneEnd], allow_u_turn: bool = false) -> Array:
 	var in_dir := _flat(incoming.direction).normalized()
 	var in_right := Vector2(-in_dir.y, in_dir.x)
 	var min_dot := cos(deg_to_rad(MAX_DEFAULT_TURN))
@@ -937,11 +952,13 @@ func _default_outs(incoming: LaneEnd, ends: Array[LaneEnd], allow_u_turn: bool =
 		for e in ends:
 			if not e.incoming:
 				(targets.get_or_add(e.segment_id, []) as Array).append(e)
-	# Roads from the sharpest right turn to the sharpest left (a U-turn is last).
+	# Roads from the sharpest right turn to the sharpest left (a U-turn is last),
+	# judged by where each road heads over its first stretch, so a slip lane that
+	# leaves tangentially and bends right counts as further right.
 	var order: Array = targets.keys()
 	var turn := {}
 	for sid: int in order:
-		var d := _flat((targets[sid][0] as LaneEnd).direction).normalized()
+		var d := _flat(_heading_away(node_id, sid, TURN_JUDGE_DISTANCE))
 		turn[sid] = -PI if sid == incoming.segment_id else atan2(d.dot(in_right), d.dot(in_dir))
 	order.sort_custom(func(a: int, b: int) -> bool: return turn[a] > turn[b])
 	# This lane's place among its road's incoming lanes, right to left.
@@ -973,6 +990,18 @@ func _default_outs(incoming: LaneEnd, ends: Array[LaneEnd], allow_u_turn: bool =
 			if _shares_part(p, lanes_to_j, q, c):
 				outs.append(target_lanes[q].key)
 	return outs
+
+
+## Direction from a road's end at `node_id` to the point `distance` m along it
+## (or its far end): where the road heads, even if it starts out tangent to another.
+func _heading_away(node_id: int, segment_id: int, distance: float) -> Vector3:
+	var seg: RoadSegment = segments[segment_id]
+	var length := seg.curve.get_length()
+	var d := minf(distance, length)
+	var at_start := seg.start_id == node_id
+	var from := seg.curve.point(0.0 if at_start else 1.0)
+	var to := seg.curve.point(seg.curve.t_at_distance(d if at_start else length - d))
+	return (to - from).normalized()
 
 
 ## True if part `a` of `na` equal parts of [0, 1] overlaps part `b` of `nb`.
@@ -1251,26 +1280,33 @@ func _junction_shape(node: RoadNode) -> Dictionary:
 	var poly := PackedVector2Array()
 	var center := _flat(node.position)
 	if n >= 2:
+		# Per pair of neighbors (i, i + 1): the gore point, or whether they lie side
+		# by side on top of each other (a slip lane leaving along a lane of the road).
+		var gores: Array = []
+		var side_by_side: Array[bool] = []
 		for i in n:
 			var a := ends[i]
 			var b := ends[(i + 1) % n]
-			_append_unique(poly, a.left)
+			var gore: Variant = _gore_point(a, b, center)
+			gores.append(gore)
+			side_by_side.append(gore == null and _ends_side_by_side(a, b))
+		for i in n:
+			var a := ends[i]
+			var b := ends[(i + 1) % n]
+			# Side by side ends share one outline: skip the corners inside the other road.
+			if not side_by_side[(i + n - 1) % n]:
+				_append_unique(poly, a.left)
+			if side_by_side[i]:
+				continue
 			_append_unique(poly, a.right)
+			if gores[i] != null:
+				_append_unique(poly, gores[i])
+				continue
 			# Round the corner between a's right edge and b's left edge.
 			var hit: Variant = _line_intersection(a.right, a.out_right, b.left, b.out_left)
-			if hit == null:
+			if hit == null or hit.x >= 0.0 or hit.y >= 0.0:
 				continue
 			var x: Vector2 = a.right + a.out_right * hit.x
-			if (hit.x < 0.0) != (hit.y < 0.0):
-				# Tight angle where one end couldn't be cut back far enough (short
-				# segment): the edges cross past that end. Follow both edges to the
-				# crossing so the gore between them stays paved.
-				var reach := maxf((a.right as Vector2).distance_to(center), (b.left as Vector2).distance_to(center))
-				if (a.out_right as Vector2).dot(b.out_left) > 0.0 and x.distance_to(center) <= reach + 0.5:
-					_append_unique(poly, x)
-				continue
-			if hit.x >= 0.0:
-				continue
 			var radius: float = (a.settings as EndSettings).radius
 			var pts := PackedVector2Array()
 			if radius >= 0.0:
@@ -1287,6 +1323,36 @@ func _junction_shape(node: RoadNode) -> Dictionary:
 		if poly.size() > 2 and poly[0].distance_to(poly[poly.size() - 1]) < 0.01:
 			poly.remove_at(poly.size() - 1)
 	return {"ends": ends, "poly": poly}
+
+
+## Tight angle where one end couldn't be cut back far enough (short segment): a's
+## right edge and b's left edge cross past that end. Returns the crossing, so the
+## outline can follow both edges there and keep the gore paved, or null.
+static func _gore_point(a: Dictionary, b: Dictionary, center: Vector2) -> Variant:
+	var hit: Variant = _line_intersection(a.right, a.out_right, b.left, b.out_left)
+	if hit == null or (hit.x < 0.0) == (hit.y < 0.0):
+		return null
+	var x: Vector2 = a.right + a.out_right * hit.x
+	var reach := maxf((a.right as Vector2).distance_to(center), (b.left as Vector2).distance_to(center))
+	if (a.out_right as Vector2).dot(b.out_left) > 0.0 and x.distance_to(center) <= reach + 0.5:
+		return x
+	return null
+
+
+## True if neighboring ends leave nearly parallel with one's inner corner on the
+## other's road (e.g. a slip lane snapped onto a lane, running along it).
+static func _ends_side_by_side(a: Dictionary, b: Dictionary) -> bool:
+	if (a.out as Vector2).dot(b.out) < cos(deg_to_rad(20.0)):
+		return false
+	return _on_road_end(b.left, a) or _on_road_end(a.right, b)
+
+
+## True if `p` lies on the road beyond the end's cut (not at its very edge).
+static func _on_road_end(p: Vector2, e: Dictionary) -> bool:
+	var d: Vector2 = p - e.center
+	var out: Vector2 = e.out
+	var half := (e.right as Vector2).distance_to(e.center)
+	return d.dot(out) > -0.05 and absf(d.dot(Vector2(-out.y, out.x))) < half - 0.05
 
 
 ## Points of a circular curb of `radius` between two edges that meet at `x`,

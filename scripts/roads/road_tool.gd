@@ -19,7 +19,8 @@ const SEGMENT_SNAP_EXTRA := 1.0
 const MIN_ROAD_LENGTH := 4.0
 const MAX_TURN_DEGREES := 120.0
 const MIN_JUNCTION_ANGLE := 25.0
-## A road snapped to a lane may branch off at a shallow angle (like a ramp).
+## A road snapped to lanes may run along them (slip lanes, ramps) if it travels
+## their way; one running against them must still branch off at this angle.
 const MIN_LANE_BRANCH_ANGLE := 5.0
 const MISMATCH_TEXT := "Lane direction mismatch: this road runs against the lane it joins"
 const ANGLE_STEP := 15.0
@@ -494,23 +495,25 @@ func _init_start_directions() -> void:
 			_start_ref = network.get_segment(hit.segment_id).curve.tangent(hit.t)
 
 
-## Snaps to nodes and roads (and, for one-lane roads, to whichever lane center
-## of a wider road is closest to the mouse), otherwise to the angle/length grid.
+## Snaps to nodes and roads (and, for one-way roads, to whichever lanes of a
+## wider road they'd line up with are closest to the mouse), otherwise to the
+## angle/length grid.
 func _compute_snap(raw: Vector3, allow_network: bool) -> Dictionary:
 	if allow_network:
-		var lane_snapping := road_type.lanes.size() == 1
+		var lane_snapping := road_type.is_one_way()
+		var lanes := road_type.lanes.size()
 		var nid := network.find_node_near(raw, NODE_SNAP_RADIUS)
 		if nid >= 0:
 			var node_pos := network.get_node_data(nid).position
 			var snap := _make_snap(node_pos, node_pos, nid, false)
 			if lane_snapping:
-				_snap_to_closest_lane(snap, raw, network.node_lane_points(nid))
+				_snap_to_closest_lane(snap, raw, network.node_lane_points(nid, lanes))
 			return snap
 		var hit := network.find_segment_near(raw, SEGMENT_SNAP_EXTRA, true)
 		if not hit.is_empty():
 			var snap := _make_snap(hit.point, hit.point, -1, true)
 			if lane_snapping:
-				_snap_to_closest_lane(snap, raw, network.segment_lane_points(hit.segment_id, hit.t))
+				_snap_to_closest_lane(snap, raw, network.segment_lane_points(hit.segment_id, hit.t, lanes))
 			return snap
 	var pos := raw
 	if _has_start and grid_snap and not Input.is_key_pressed(KEY_SHIFT):
@@ -605,14 +608,20 @@ func _validate(curve: RoadCurve, end_snap: Dictionary) -> String:
 		return "Can't connect a node to itself"
 	if rad_to_deg(curve.tangent(0.0).angle_to(curve.tangent(1.0))) > MAX_TURN_DEGREES:
 		return "Curve too sharp"
-	if _junction_angle(_start, curve.tangent(0.0)) < _min_angle_for(_start) \
-			or _junction_angle(end_snap, -curve.tangent(1.0)) < _min_angle_for(end_snap):
+	if _junction_angle(_start, curve.tangent(0.0)) < _min_angle_for(_start, curve.tangent(0.0)) \
+			or _junction_angle(end_snap, -curve.tangent(1.0)) < _min_angle_for(end_snap, curve.tangent(1.0)):
 		return "Angle to existing road too small"
 	return ""
 
 
-func _min_angle_for(snap: Dictionary) -> float:
-	return MIN_LANE_BRANCH_ANGLE if (snap.lane_dir as Vector3) != Vector3.ZERO else MIN_JUNCTION_ANGLE
+## Smallest angle a road end may make with the roads already at `snap`. A road
+## snapped to lanes may run along them (a slip lane leaving or joining a road)
+## if it travels (`travel_dir` at that end) the same way as those lanes.
+func _min_angle_for(snap: Dictionary, travel_dir: Vector3) -> float:
+	var lane_dir: Vector3 = snap.lane_dir
+	if lane_dir == Vector3.ZERO:
+		return MIN_JUNCTION_ANGLE
+	return 0.0 if travel_dir.dot(lane_dir) > 0.5 else MIN_LANE_BRANCH_ANGLE
 
 
 ## Smallest angle between a new road leaving `snap` along `dir` and roads already there.

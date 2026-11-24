@@ -18,6 +18,7 @@ func _initialize() -> void:
 	_test_upgrade()
 	_test_lane_snapping()
 	_test_tight_exit()
+	_test_slip_lanes()
 	_test_lane_editing()
 	_test_lane_edit_scope()
 	_test_multi_lane_connections()
@@ -402,17 +403,70 @@ func _test_multi_lane_connections() -> void:
 	net.free()
 
 
+## Corner slip lanes: road V runs north into a corner, road H east out of it. A
+## one-way leaves V's northbound lane(s) tangentially and joins H's eastbound
+## lane(s) tangentially, cutting the corner. With `wide`, both roads have four
+## lanes and the slip road two.
+func _test_slip_lanes() -> void:
+	for wide: bool in [false, true]:
+		var road := RoadType.get_type(&"four_lane") if wide else _two
+		var slip := RoadType.get_type(&"one_way_2") if wide else _one
+		var lateral := 3.0 if wide else 1.5  # center of the lanes the slip road uses
+		var name := "wide slip" if wide else "slip lane"
+		var net := _new_net()
+		net.build_road(RoadCurve.straight(Vector3(0, 0, 100), Vector3.ZERO), road)
+		var corner := net.find_node_near(Vector3.ZERO, 0.1)
+		net.build_road(RoadCurve.straight(Vector3.ZERO, Vector3(100, 0, 0)), road, {"node": corner})
+		var v_in := _seg_at(net, Vector3(0, 0, 70))
+		var points := net.segment_lane_points(v_in, 0.6, slip.lanes.size())
+		_check(points.size() == 2, "%s: the road offers 2 snap spots for it (got %d)" % [name, points.size()])
+		var built := net.build_road(RoadCurve.quadratic(Vector3(lateral, 0, 40), Vector3(lateral, 0, lateral), Vector3(40, 0, lateral)), slip,
+			{"on_segment": true, "anchor": Vector3(0, 0, 40)}, {"on_segment": true, "anchor": Vector3(40, 0, 0)})
+		_check(built and net.segments.size() == 5, "%s: built, splitting both roads" % name)
+		for node: RoadNetwork.RoadNode in net.nodes.values():
+			if node.segment_ids.size() >= 2:
+				_check(node.mesh_instance != null, "%s: node at %s has a junction surface" % [name, node.position])
+			_check(not node.lane_mismatch, "%s: no lane mismatch at %s" % [name, node.position])
+		# The slip road and both its junctions; not the V/H corner itself, whose
+		# outer corner is cut diagonally like every two-road corner.
+		var result := _surface_check(net, Rect2(-8, 8, 56, 40)) + _surface_check(net, Rect2(8, -8, 40, 16))
+		_check(result.x == 0, "%s: no holes in the road surface (%d points)" % [name, result.x])
+		_check(result.y == 0, "%s: junctions pave no grass (%d points)" % [name, result.y])
+		# Where it leaves: V's right lane(s) go on along V and into the slip road.
+		var diverge := net.find_node_near(Vector3(0, 0, 40), 0.5)
+		var slip_id := -1
+		for sid in net.get_node_data(diverge).segment_ids:
+			if net.get_segment(sid).type == slip:
+				slip_id = sid
+		var lanes_in: Array = net.get_lane_ends(diverge).filter(func(e: RoadNetwork.LaneEnd) -> bool:
+			return e.incoming and e.segment_id != slip_id)
+		lanes_in.sort_custom(func(a: RoadNetwork.LaneEnd, b: RoadNetwork.LaneEnd) -> bool: return a.position.x > b.position.x)
+		var right_outs := _outs(net, diverge, lanes_in[0].key)
+		_check(right_outs.any(func(k: int) -> bool: return RoadNetwork.key_segment(k) == slip_id),
+			"%s: the right lane can take the slip road" % name)
+		if wide:
+			var left_outs := _outs(net, diverge, lanes_in[1].key)
+			_check(not left_outs.any(func(k: int) -> bool: return RoadNetwork.key_segment(k) == slip_id),
+				"%s: the left lane goes straight on (got %s)" % [name, left_outs])
+		# Where it joins: every slip lane merges into H.
+		var merge := net.find_node_near(Vector3(40, 0, 0), 0.5)
+		for e in net.get_lane_ends(merge):
+			if e.incoming and e.segment_id == slip_id:
+				_check(_outs(net, merge, e.key).size() == 1, "%s: each slip lane merges into one lane of H" % name)
+		net.free()
+
+
 ## Vector2i(road points no mesh covers, junction points off every road), on a
 ## 0.25 m grid around the origin.
-func _surface_check(net: RoadNetwork) -> Vector2i:
+func _surface_check(net: RoadNetwork, area := Rect2(-10, -30, 30, 40)) -> Vector2i:
 	var polys: Array[PackedVector2Array] = []
 	for node: RoadNetwork.RoadNode in net.nodes.values():
 		if node.segment_ids.size() >= 2:
 			polys.append(net._junction_shape(node).poly)
 	var holes := 0
 	var grass := 0
-	for ix in range(-40, 81):
-		for iz in range(-120, 41):
+	for ix in range(int(area.position.x * 4.0), int(area.end.x * 4.0) + 1):
+		for iz in range(int(area.position.y * 4.0), int(area.end.y * 4.0) + 1):
 			var p := Vector3(ix * 0.25, 0, iz * 0.25)
 			var road := false
 			var near_road := false
